@@ -1041,15 +1041,25 @@ if run:
                 continue
 
             # ===== Scope selection: Global vs one match =====
-            st.markdown("### 🎯 Scope d'analyse")
-            match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
-            scope_choice = st.selectbox(
-                "Choisir : Global ou un match précis",
-                match_options,
-                index=0,
-                help="Global = agrégation sur tous les matchs. Match précis = mêmes données mais uniquement sur ce match."
-            )
-            bundles_view = bundles_f if scope_choice == "Global (tous les matchs)" else [b for b in bundles_f if b["matchId"] == scope_choice]
+           match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
+
+scope_choice = st.selectbox(
+    "Choisir : Global ou un match précis",
+    match_options,
+    index=0,
+    key=f"scope_{rid_full}",  # IMPORTANT: clé unique par joueur
+    help="Global = agrégation sur tous les matchs. Match précis = mêmes données mais uniquement sur ce match."
+)
+
+scope_label = "Global" if scope_choice == "Global (tous les matchs)" else scope_choice
+
+bundles_view = bundles_f if scope_choice == "Global (tous les matchs)" else [b for b in bundles_f if b["matchId"] == scope_choice]
+
+# sécurité: si jamais pas trouvé (rare mais possible), on évite le crash
+if not bundles_view:
+    st.warning("Le match sélectionné n'a pas été retrouvé après filtres. Essaie en 'Global' ou enlève les filtres.")
+    continue
+
 
             # aggregate dfs (deaths segments + mid + kills)
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
