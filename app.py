@@ -934,6 +934,22 @@ def mean_safe(values):
     return float(np.mean(clean))
 
 
+def series_for_player_in_match(client: RiotClient, match_id: str, puuid: str) -> Optional[pd.DataFrame]:
+    try:
+        match = client.get_match(match_id)
+        tl = client.get_timeline(match_id)
+    except Exception:
+        return None
+
+    pid = find_pid_by_puuid(match, puuid)
+    if not pid:
+        return None
+
+    dur_s = match["info"].get("gameDuration", 0) or 0
+    max_min = int(dur_s // 60)
+    return timeline_series_full_minutes(tl, pid, max_min=max_min)
+
+
 if run:
     # minimap
     try:
