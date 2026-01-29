@@ -1060,6 +1060,12 @@ if run:
           st.warning("Le match sélectionné n'a pas été retrouvé après filtres. Essaie en 'Global' ou enlève les filtres.")
           continue
 
+              
+              if scope_choice != "Global (tous les matchs)":
+    m = bundles_view[0]["match"]
+    dur = int((m["info"].get("gameDuration", 0) or 0) // 60)
+    st.caption(f"Match sélectionné: {scope_choice} • Durée: {dur} min • Champion: {bundles_view[0]['champion']} • Role: {bundles_view[0]['role']} • Side: {bundles_view[0]['side']}")
+
 
             # aggregate dfs (deaths segments + mid + kills)
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
