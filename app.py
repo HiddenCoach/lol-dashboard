@@ -725,8 +725,8 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("EUW — Coach Dashboard (Pro & Scrim)")
-st.caption("Minimap interactive (points BLUE/RED par match) + heatmaps deaths/kills + laning review + macro + Team A vs Team B + mode scrim (custom).")
+st.title("Analyse Heatmap et Data, par Hidden Analyste Coach")
+st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom).")
 
 with st.sidebar:
     st.header("Mode")
