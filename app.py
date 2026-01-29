@@ -725,8 +725,8 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Analyse Heatmap et Data, par Hidden Analyste Coach")
-st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom).")
+st.title("Analyse Heatmap et Data, par Hidden Analyst Coach")
+st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), option analyse matchup vs joueur en particulier)")
 
 with st.sidebar:
     st.header("Mode")
