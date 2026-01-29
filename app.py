@@ -230,24 +230,27 @@ def fig_to_png_bytes(fig) -> bytes:
     plt.close(fig)
     return buf.getvalue()
 
-def plot_minimap_heatmap(
+def plot_minimap_deaths(
     minimap: Image.Image,
     deaths_df: pd.DataFrame,
     title: str,
-    mode: str = "hex",
+    side: str,
+    style: str = "scatter",   # "scatter" recommandé (points visibles)
+    point_size: int = 90,     # <- gros points
+    alpha: float = 0.75,
 ):
     """
-    Heatmap sur minimap. deaths_df contient colonnes x,y (coords timeline).
-    mode: "hex" ou "scatter"
+    Morts sur minimap. Points gros + couleur selon side.
     """
     if deaths_df is None or deaths_df.empty:
         return None
 
     w, h = minimap.size
-    # Convert coords -> pixels
     nxy = np.array([norm_xy(x, y) for x, y in zip(deaths_df["x"].values, deaths_df["y"].values)])
     px_py = np.array([norm_to_px(nx, ny, w, h) for nx, ny in nxy])
     px, py = px_py[:, 0], px_py[:, 1]
+
+    color = "#1E88E5" if side == "BLUE" else "#E53935"  # bleu / rouge
 
     fig = plt.figure(figsize=(6.2, 6.2))
     ax = plt.gca()
@@ -256,24 +259,24 @@ def plot_minimap_heatmap(
     ax.set_xlabel("X (minimap pixels)")
     ax.set_ylabel("Y (minimap pixels)")
 
-    if mode == "scatter" or len(px) < 20:
-        ax.scatter(px, py, s=22, alpha=0.6)
+    # Scatter très lisible
+    if style == "scatter":
+        ax.scatter(
+            px, py,
+            s=point_size,
+            alpha=alpha,
+            c=color,
+            edgecolors="white",
+            linewidths=0.9
+        )
     else:
-        ax.hexbin(px, py, gridsize=42, mincnt=1, alpha=0.7)
+        # Hexbin utile si énormément de morts
+        ax.hexbin(px, py, gridsize=42, mincnt=1, alpha=0.65)
 
     ax.set_xlim(0, w)
-    ax.set_ylim(h, 0)  # keep origin top-left
+    ax.set_ylim(h, 0)
     return fig
 
-def plot_line(df: pd.DataFrame, x_col: str, y_col: str, title: str, x_label: str, y_label: str):
-    if df is None or df.empty or df[y_col].dropna().empty:
-        return None
-    fig = plt.figure(figsize=(6.4, 3.2))
-    plt.plot(df[x_col], df[y_col])
-    plt.title(title)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    return fig
 
 # ---------------- PDF export ----------------
 def build_player_pdf(
