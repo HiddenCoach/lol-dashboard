@@ -902,6 +902,14 @@ def fmt(v: Optional[float], digits: int = 0) -> str:
 
 
 def mean_safe(values):
+    clean = [
+        v for v in values
+        if v is not None and not (isinstance(v, float) and np.isnan(v))
+    ]
+    return float(np.mean(clean)) if clean else None
+
+
+def mean_safe(values):
     """
     Moyenne robuste :
     - ignore None
