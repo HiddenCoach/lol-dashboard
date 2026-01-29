@@ -208,16 +208,13 @@ def role_aware_zone(x: float, y: float, role: str) -> str:
     d_diag = abs(nx - ny)
     center_dist = ((nx - 0.5) ** 2 + (ny - 0.5) ** 2) ** 0.5
 
-    # Mid / River
     if d_diag < 0.05 and center_dist < 0.30:
         base = "MID"
     elif d_diag < 0.07:
         base = "RIVER"
     else:
-        # baron side (upper-left) corresponds to ny > nx
         base = "TOP_SIDE" if ny > nx else "BOT_SIDE"
 
-    # Lane corridor hints (only if far from mid/river)
     top_lane_corridor = (nx < 0.38 and ny > 0.62)
     bot_lane_corridor = (nx > 0.62 and ny < 0.38)
     if base == "TOP_SIDE" and top_lane_corridor:
@@ -1040,10 +1037,8 @@ if run:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
 
-            
-                      # ===== Scope selection: Global vs one match =====
+            # ===== Scope selection: Global vs one match (SOURCE OF TRUTH = bundles_use) =====
             st.markdown("### 🎯 Scope d'analyse")
-
             match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
 
             scope_choice = st.selectbox(
@@ -1056,22 +1051,24 @@ if run:
 
             scope_label = "Global" if scope_choice == "Global (tous les matchs)" else scope_choice
 
-            bundles_view = bundles_f if scope_choice == "Global (tous les matchs)" else [
+            bundles_use = bundles_f if scope_choice == "Global (tous les matchs)" else [
                 b for b in bundles_f if b["matchId"] == scope_choice
             ]
 
-            if not bundles_view:
+            if not bundles_use:
                 st.warning("Le match sélectionné n'a pas été retrouvé après filtres. Essaie 'Global' ou enlève les filtres.")
                 continue
 
-            if scope_choice != "Global (tous les matchs)":
-                m = bundles_view[0]["match"]
-                dur = int((m["info"].get("gameDuration", 0) or 0) // 60)
-                st.caption(
-                    f"Match sélectionné: {scope_choice} • Durée: {dur} min • "
-                    f"Champion: {bundles_view[0]['champion']} • Role: {bundles_view[0]['role']} • Side: {bundles_view[0]['side']}"
-                )
+            # visual confirmation
+            st.success(f"Scope actif: **{scope_label}** • matchs dans le scope: **{len(bundles_use)}**")
 
+            if scope_choice != "Global (tous les matchs)":
+                mi = bundles_use[0]["match"]["info"]
+                dur = int((mi.get("gameDuration", 0) or 0) // 60)
+                st.caption(
+                    f"Match: {scope_choice} • Durée: {dur} min • "
+                    f"Champion: {bundles_use[0]['champion']} • Role: {bundles_use[0]['role']} • Side: {bundles_use[0]['side']}"
+                )
 
             # aggregate dfs (deaths segments + mid + kills)
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
@@ -1080,7 +1077,7 @@ if run:
             zone0_list, zoneMid_list = [], []
             obj_rows = []
 
-            max_duration_min = max([b["max_min"] for b in bundles_view])
+            max_duration_min = max([b["max_min"] for b in bundles_use])
             series_stack = []
 
             # laning compare
@@ -1092,7 +1089,7 @@ if run:
 
             deaths0_count, deathsMid_count = [], []
 
-            for b in bundles_view:
+            for b in bundles_use:
                 for src, acc in [
                     (b["d_0_5"], d0_5_all),
                     (b["d_5_10"], d5_10_all),
@@ -1128,6 +1125,9 @@ if run:
                     extra["cs_per_min_avg"] = last.get("cs_per_min_avg", np.nan)
                     extra["cs_in_min"] = 0.0
                     s = pd.concat([s, extra], ignore_index=True)
+                else:
+                    s = s[s["minute"] <= max_duration_min]
+
                 series_stack.append(s[["minute", "gold", "xp", "damage", "cs_total", "cs_per_min_avg", "cs_in_min"]].copy())
 
                 # laning comparisons
@@ -1180,16 +1180,17 @@ if run:
             df_kills = pd.concat(kills_all_list, ignore_index=True) if kills_all_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
 
             # series mean minute-by-minute
-            series_all = pd.concat(series_stack, ignore_index=True)
-            series_mean = series_all.groupby("minute", as_index=False).mean(numeric_only=True)
-            series_mean["minute"] = series_mean["minute"].astype(int)
+            series_all = pd.concat(series_stack, ignore_index=True) if series_stack else pd.DataFrame(columns=["minute","gold","xp","damage","cs_total","cs_per_min_avg","cs_in_min"])
+            series_mean = series_all.groupby("minute", as_index=False).mean(numeric_only=True) if not series_all.empty else pd.DataFrame({"minute":[0]})
+            if "minute" in series_mean.columns:
+                series_mean["minute"] = series_mean["minute"].astype(int)
 
-            # optional compare series
+            # optional compare series (scope-based for "same matches")
             compare_series_mean = None
-            if compare_puuid:
+            if compare_puuid and not series_mean.empty and "minute" in series_mean.columns:
                 comp_stack = []
                 if compare_mode == "Même matchs (si présent)":
-                    for b in bundles_view:
+                    for b in bundles_use:
                         s2 = series_for_player_in_match(client, b["matchId"], compare_puuid)
                         if s2 is None or s2.empty:
                             continue
@@ -1231,8 +1232,8 @@ if run:
                     compare_series_mean = comp_all.groupby("minute", as_index=False).mean(numeric_only=True)
                     compare_series_mean["minute"] = compare_series_mean["minute"].astype(int)
 
-            champ = bundles_view[0]["champion"]
-            role = bundles_view[0]["role"]
+            champ = bundles_use[0]["champion"]
+            role = bundles_use[0]["role"]
 
             me_deaths0 = float(np.mean(deaths0_count)) if deaths0_count else None
             me_deathsMid = float(np.mean(deathsMid_count)) if deathsMid_count else None
@@ -1269,13 +1270,16 @@ if run:
                 c3.metric("Gold@15 vs lobby", f"{lobby_gold_diff_15:.0f}" if lobby_gold_diff_15 is not None else "—")
                 c4.metric("XP@15 vs lobby", f"{lobby_xp_diff_15:.0f}" if lobby_xp_diff_15 is not None else "—")
 
-                scope_label = "Global" if scope_choice == "Global (tous les matchs)" else scope_choice
                 st.markdown(
-                    f"<div class='card'><b>Profil</b> : {champ} • {role} • Mode: {'SCRIM' if scrim_mode else 'NORMAL'} • {('—' if scrim_mode else queue_label)} • <b>Scope:</b> {scope_label}</div>",
+                    f"<div class='card'><b>Profil</b> : {champ} • {role} • Mode: {'SCRIM' if scrim_mode else 'NORMAL'} • "
+                    f"{('—' if scrim_mode else queue_label)} • <b>Scope:</b> {scope_label}</div>",
                     unsafe_allow_html=True
                 )
-                if compare_series_mean is None and compare_player_text.strip():
-                    st.warning("Comparaison activée mais aucune donnée overlay (joueur non trouvé / pas de matchs / rate-limit).")
+
+                if compare_player_text.strip() and compare_puuid is None:
+                    st.warning("Comparaison: Riot ID invalide ou introuvable.")
+                elif compare_puuid and compare_series_mean is None:
+                    st.warning("Comparaison activée mais aucune donnée overlay (joueur non présent / aucun match / rate-limit).")
 
                 st.divider()
 
@@ -1315,44 +1319,55 @@ if run:
 
                 with right:
                     st.markdown("#### Courbes minute-par-minute (entiers)")
-                    # overlay if compare exists; otherwise show simple charts
+
                     if compare_series_mean is not None:
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "gold", "Gold — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "xp", "XP — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "damage", "Dégâts (metric) — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                     else:
-                        plot_df = series_mean.set_index("minute")[["gold", "xp", "damage"]]
-                        st.line_chart(plot_df[["gold"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = Gold")
-                        st.line_chart(plot_df[["xp"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = XP")
-                        st.line_chart(plot_df[["damage"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = Dégâts (metric)")
+                        if not series_mean.empty and "minute" in series_mean.columns:
+                            plot_df = series_mean.set_index("minute")[["gold", "xp", "damage"]]
+                            st.line_chart(plot_df[["gold"]], height=170)
+                            st.caption("x = minute entière (0,1,2,...) • y = Gold")
+                            st.line_chart(plot_df[["xp"]], height=170)
+                            st.caption("x = minute entière (0,1,2,...) • y = XP")
+                            st.line_chart(plot_df[["damage"]], height=170)
+                            st.caption("x = minute entière (0,1,2,...) • y = Dégâts (metric)")
+                        else:
+                            st.info("Pas assez de données de timeline pour tracer les courbes.")
 
-                    st.markdown("#### CS/min (moyen) — minute par minute")
-                    fig_cs = plot_compare_line(
-                        series_mean,
-                        compare_series_mean,
-                        y="cs_per_min_avg",
-                        title="CS/min (moyen) — comparaison" if compare_series_mean is not None else "CS/min (moyen)",
-                        name_a=rid_full,
-                        name_b=(compare_label or "Comparé")
-                    )
-                    st.plotly_chart(fig_cs, use_container_width=True)
+                    if not series_mean.empty and "cs_per_min_avg" in series_mean.columns:
+                        st.markdown("#### CS/min (moyen) — minute par minute")
+                        st.plotly_chart(
+                            plot_compare_line(
+                                series_mean,
+                                compare_series_mean,
+                                y="cs_per_min_avg",
+                                title="CS/min (moyen) — comparaison" if compare_series_mean is not None else "CS/min (moyen)",
+                                name_a=rid_full,
+                                name_b=(compare_label or "Comparé"),
+                            ),
+                            use_container_width=True
+                        )
 
-                    st.markdown("#### CS gagnés par minute (delta)")
-                    fig_cs_delta = plot_compare_line(
-                        series_mean,
-                        compare_series_mean,
-                        y="cs_in_min",
-                        title="CS gagnés/min — comparaison" if compare_series_mean is not None else "CS gagnés/min",
-                        name_a=rid_full,
-                        name_b=(compare_label or "Comparé")
-                    )
-                    st.plotly_chart(fig_cs_delta, use_container_width=True)
+                        st.markdown("#### CS gagnés par minute (delta)")
+                        st.plotly_chart(
+                            plot_compare_line(
+                                series_mean,
+                                compare_series_mean,
+                                y="cs_in_min",
+                                title="CS gagnés/min — comparaison" if compare_series_mean is not None else "CS gagnés/min",
+                                name_a=rid_full,
+                                name_b=(compare_label or "Comparé"),
+                            ),
+                            use_container_width=True
+                        )
 
                     st.markdown("#### Durée max analysée")
-                    st.metric("Max minute (match le plus long)", f"{int(series_mean['minute'].max())} min")
+                    if not series_mean.empty and "minute" in series_mean.columns:
+                        st.metric("Max minute (match le plus long)", f"{int(series_mean['minute'].max())} min")
+                    else:
+                        st.metric("Max minute (match le plus long)", "—")
 
             with t_laning:
                 st.markdown("### Review Laning (vs matchup direct = même rôle)")
@@ -1441,9 +1456,9 @@ if run:
                     f"Events objectifs 0–15: {len(obj_df) if obj_df is not None and not obj_df.empty else 0}."
                 )
 
-                if st.button(f"Générer PDF — {rid_full} (scope)", key=f"pdf_{rid_full}_{scope_label}"):
+                safe_scope = scope_label.replace(":", "_").replace("/", "_").replace("\\", "_")
+                if st.button(f"Générer PDF — {rid_full} ({scope_label})", key=f"pdf_{rid_full}_{safe_scope}"):
                     os.makedirs("exports", exist_ok=True)
-                    safe_scope = ("Global" if scope_choice == "Global (tous les matchs)" else scope_choice).replace(":", "_")
                     pdf_path = os.path.join("exports", f"{rid_full.replace('#', '_')}_{safe_scope}_report.pdf")
 
                     meta = {
