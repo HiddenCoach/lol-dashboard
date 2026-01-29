@@ -765,6 +765,15 @@ with st.sidebar:
     teamB_text = st.text_area("Team B (5 lignes, GameName#TAG)", height=100, disabled=(not enable_team_vs))
     team_match_count = st.slider("Team: matchs à scanner", 5, 30, 12, disabled=(not enable_team_vs))
 
+    st.header("Comparaison joueur (optionnel)")
+    compare_player_text = st.text_input("Comparer avec Riot ID (GameName#TAG)")
+    compare_mode = st.radio(
+    "Mode comparaison",
+    ["Même matchs (si présent)", "Ses matchs récents"],
+    index=0
+)
+    compare_match_count = st.slider("Nb matchs pour joueur comparé", 1, 30, 10)
+
     st.header("Perf")
     max_samples = st.slider("Max matchs traités par joueur (CPU)", 5, 40, 20)
 
