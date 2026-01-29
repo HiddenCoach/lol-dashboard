@@ -581,5 +581,81 @@ if run:
             with c2:
                 st.metric("XP @15 (moy.)", f"{me_xp15:.0f}" if me_xp15 is not None else "—",
                           format_delta(me_xp15, peer_summary["peer"]["xp15"]) if (peer_summary and peer_summary.get("peer")) else None)
-            wit
+            with c3:
+                st.metric("Morts 0–15 (moy.)", f"{me_deaths15:.2f}" if me_deaths15 is not None else "—",
+                          format_delta(me_deaths15, peer_summary["peer"]["deaths15"]) if (peer_summary and peer_summary.get("peer")) else None)
+            with c4:
+                st.metric("Rang (queue)", peer_summary["rank_label"] if peer_summary and peer_summary.get("rank_label") else "—")
+
+            st.divider()
+
+            # --- Layout: minimap + charts ---
+            colA, colB = st.columns([1.25, 1])
+
+            with colA:
+                st.markdown("### Heatmap des morts (0–15) — sur minimap")
+                fig = plot_minimap_heatmap(minimap, deaths_all_df, f"{rid_full} — morts (0–15)", mode="hex")
+                if fig:
+                    st.pyplot(fig, clear_figure=True)
+                else:
+                    st.info("Aucune mort trouvée (0–15) dans l’échantillon filtré.")
+
+                st.markdown("### Heatmaps par phase")
+                p1, p2, p3 = st.columns(3)
+                for cc, ph in zip([p1, p2, p3], ["0-5", "5-10", "10-15"]):
+                    with cc:
+                        figp = plot_minimap_heatmap(minimap, deaths_by_phase_df[ph], f"{ph}", mode="hex")
+                        if figp:
+                            st.pyplot(figp, clear_figure=True)
+                        else:
+                            st.caption(f"{ph}: —")
+
+            with colB:
+                st.markdown("### Early game (0–15)")
+                fg = plot_line(early_mean, "minute", "gold", "Gold (0–15)", "Temps (minutes)", "Gold")
+                fx = plot_line(early_mean, "minute", "xp", "XP (0–15)", "Temps (minutes)", "XP")
+                fd = plot_line(early_mean, "minute", "damage", "Dégâts (metric) (0–15)", "Temps (minutes)", "Dégâts")
+                for f in [fg, fx, fd]:
+                    if f:
+                        st.pyplot(f, clear_figure=True)
+
+                if peer_summary and peer_summary.get("text"):
+                    st.markdown("### Comparaison même rang")
+                    st.write(peer_summary["text"])
+                    st.caption("Note: peers pris parmi les participants des mêmes matchs (échantillon limité) pour éviter de spam l’API.")
+
+            # --- Export PDF ---
+            st.divider()
+            st.markdown("### Export")
+            if st.button(f"Générer PDF — {rid_full}", key=f"pdf_{rid_full}"):
+                os.makedirs("exports", exist_ok=True)
+                pdf_path = os.path.join("exports", f"{rid_full.replace('#','_')}_report.pdf")
+
+                m0 = bundles_f[0]
+                meta = {
+                    "champion": m0["champion"],
+                    "role": m0["role"],
+                    "side": m0["side"],
+                    "queue": queue_label
+                }
+
+                build_player_pdf(
+                    out_path=pdf_path,
+                    player_label=rid_full,
+                    meta=meta,
+                    minimap=minimap,
+                    deaths_all=deaths_all_df,
+                    deaths_by_phase=deaths_by_phase_df,
+                    early_mean=early_mean,
+                    peer_summary=peer_summary,
+                )
+
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "Télécharger le PDF",
+                        f,
+                        file_name=os.path.basename(pdf_path),
+                        mime="application/pdf",
+                        key=f"dl_{rid_full}"
+                    )
 
