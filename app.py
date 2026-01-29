@@ -3,6 +3,7 @@ import time
 import io
 import base64
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
 
 import requests
 import numpy as np
@@ -146,6 +147,27 @@ def minimap_to_base64_png(minimap: Image.Image) -> str:
     buf = io.BytesIO()
     minimap.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_champion_id_to_name() -> Dict[int, str]:
+    """
+    Mapping championId -> championName (Data Dragon)
+    Pour afficher les bans correctement.
+    """
+    ver = get_latest_ddragon_version()
+    url = f"https://ddragon.leagueoflegends.com/cdn/{ver}/data/en_US/champion.json"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()["data"]
+    out = {}
+    for champ_key, champ in data.items():
+        try:
+            cid = int(champ["key"])
+            out[cid] = champ["name"]
+        except Exception:
+            continue
+    return out
 
 
 # =========================
@@ -463,6 +485,12 @@ def objectives_0_15(timeline: Dict[str, Any]) -> pd.DataFrame:
 SIDE_COLOR = {"BLUE": "#1E88E5", "RED": "#E53935", "UNKNOWN": "#B0BEC5"}
 
 
+def minimap_to_base64_png(minimap: Image.Image) -> str:
+    buf = io.BytesIO()
+    minimap.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 def minimap_points_plotly(
     minimap: Image.Image,
     df: pd.DataFrame,
@@ -592,7 +620,7 @@ def fmt(v: Optional[float], digits: int = 0) -> str:
 
 
 # =========================
-# ANTI-CRASH schema for series (cache-safe)
+# Series schema + compare plotting
 # =========================
 REQUIRED_SERIES_COLS = ["minute", "gold", "xp", "damage", "cs_total", "cs_per_min_avg", "cs_in_min"]
 
@@ -645,6 +673,132 @@ def cached_series_for_player_in_match(match_id: str, puuid: str) -> Optional[pd.
     dur_s = match["info"].get("gameDuration", 0) or 0
     max_min = int(dur_s // 60)
     return timeline_series_full_minutes(tl, pid, max_min=max_min)
+
+
+# =========================
+# Draft / Compo / Match detail panel
+# =========================
+def _safe_dt_from_ms(ms: Optional[int]) -> str:
+    if not ms:
+        return "—"
+    try:
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "—"
+
+
+def build_team_table(match: Dict[str, Any], team_id: int) -> pd.DataFrame:
+    rows = []
+    for p in match["info"]["participants"]:
+        if p.get("teamId") != team_id:
+            continue
+        riot_name = p.get("riotIdGameName") or p.get("summonerName") or "—"
+        tag = p.get("riotIdTagline")
+        riot_full = f"{riot_name}#{tag}" if tag else riot_name
+
+        cs = (p.get("totalMinionsKilled") or 0) + (p.get("neutralMinionsKilled") or 0)
+        k = p.get("kills") or 0
+        d = p.get("deaths") or 0
+        a = p.get("assists") or 0
+
+        rows.append({
+            "Rôle": p.get("teamPosition") or "UNKNOWN",
+            "Joueur": riot_full,
+            "Champion": p.get("championName") or "UNKNOWN",
+            "K/D/A": f"{k}/{d}/{a}",
+            "CS": int(cs),
+            "Gold": int(p.get("goldEarned") or 0),
+            "Dmg champs": int(p.get("totalDamageDealtToChampions") or 0),
+            "Vision": int(p.get("visionScore") or 0),
+            "Lvl": int(p.get("champLevel") or 0),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        role_order = {"TOP": 1, "JUNGLE": 2, "MIDDLE": 3, "BOTTOM": 4, "UTILITY": 5}
+        df["_ord"] = df["Rôle"].map(lambda r: role_order.get(str(r).upper(), 99))
+        df = df.sort_values("_ord").drop(columns=["_ord"])
+    return df
+
+
+def render_match_draft_panel(match: Dict[str, Any], focus_puuid: Optional[str] = None):
+    info = match.get("info", {})
+    mid = match.get("metadata", {}).get("matchId", "—")
+
+    queue_id = info.get("queueId")
+    game_ver = info.get("gameVersion", "—")
+    map_id = info.get("mapId", "—")
+
+    dur_s = info.get("gameDuration", 0) or 0
+    dur_m = int(dur_s // 60)
+    dur_ss = int(dur_s % 60)
+
+    created_ms = info.get("gameCreation")
+
+    teams = info.get("teams", [])
+    blue_win = None
+    red_win = None
+    for t in teams:
+        if t.get("teamId") == 100:
+            blue_win = bool(t.get("win"))
+        if t.get("teamId") == 200:
+            red_win = bool(t.get("win"))
+
+    champ_map = {}
+    try:
+        champ_map = fetch_champion_id_to_name()
+    except Exception:
+        champ_map = {}
+
+    def bans_str(team_obj: Dict[str, Any]) -> str:
+        bans = team_obj.get("bans") or []
+        names = []
+        for b in bans:
+            cid = b.get("championId")
+            if cid is None:
+                continue
+            names.append(champ_map.get(int(cid), f"champId:{cid}"))
+        return ", ".join(names) if names else "—"
+
+    blue_team = next((t for t in teams if t.get("teamId") == 100), {})
+    red_team = next((t for t in teams if t.get("teamId") == 200), {})
+
+    focus_line = "—"
+    if focus_puuid:
+        fp = next((p for p in info.get("participants", []) if p.get("puuid") == focus_puuid), None)
+        if fp:
+            riot_name = fp.get("riotIdGameName") or fp.get("summonerName") or "—"
+            tag = fp.get("riotIdTagline")
+            riot_full = f"{riot_name}#{tag}" if tag else riot_name
+            focus_line = f"{riot_full} • {fp.get('teamPosition','—')} • {fp.get('championName','—')} • side={'BLUE' if fp.get('teamId')==100 else 'RED'}"
+
+    st.markdown("## 🎮 Détails du match (Draft / Compo / Résultat)")
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("Match ID", mid)
+    top2.metric("Durée", f"{dur_m:02d}:{dur_ss:02d}")
+    top3.metric("Queue", str(queue_id) if queue_id is not None else "—")
+    top4.metric("Date", _safe_dt_from_ms(created_ms))
+    st.caption(f"GameVersion: {game_ver} • Map: {map_id} • Focus: {focus_line}")
+
+    r1, r2 = st.columns(2)
+    with r1:
+        st.markdown(f"### 🔵 BLUE ({'WIN ✅' if blue_win else 'LOSE ❌' if blue_win is not None else '—'})")
+        st.caption(f"Bans: {bans_str(blue_team)}")
+    with r2:
+        st.markdown(f"### 🔴 RED ({'WIN ✅' if red_win else 'LOSE ❌' if red_win is not None else '—'})")
+        st.caption(f"Bans: {bans_str(red_team)}")
+
+    df_blue = build_team_table(match, 100)
+    df_red = build_team_table(match, 200)
+
+    t1, t2 = st.columns(2)
+    with t1:
+        st.dataframe(df_blue, use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(df_red, use_container_width=True, hide_index=True)
+
+    st.divider()
 
 
 # =========================
@@ -764,7 +918,7 @@ def compute_teamA_vs_teamB(
 
 
 # =========================
-# PDF export (basic)
+# PDF export
 # =========================
 def build_player_pdf(
     out_path: str,
@@ -857,7 +1011,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 )
 
 st.title("Heatmap et Data, par Hidden Analyst Coach NT")
-st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), comparaison optionnelle, sélection match précis (sans page vide)")
+st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, scrim custom, comparaison optionnelle, match précis + draft/compo")
 
 
 with st.sidebar:
@@ -914,7 +1068,6 @@ with st.sidebar:
         st.cache_data.clear()
         st.session_state.analysis_ready = False
         st.session_state.analysis_payload = {}
-        # aussi reset les scopes pour éviter index invalides
         for k in list(st.session_state.keys()):
             if str(k).startswith("scope_"):
                 del st.session_state[k]
@@ -1049,7 +1202,6 @@ def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: in
 should_render = run or st.session_state.analysis_ready
 
 if run:
-    # fetch + store in session_state
     try:
         minimap = fetch_minimap_image()
     except Exception as e:
@@ -1114,7 +1266,6 @@ if should_render and st.session_state.analysis_ready:
     team_vs = payload.get("team_vs")
     analysis_settings = payload.get("analysis_settings", {})
 
-    # Live resolve optional IDs (so you can type them without re-Analyser)
     client_live = RiotClient()
 
     opponent_puuid = None
@@ -1165,12 +1316,10 @@ if should_render and st.session_state.analysis_ready:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
 
-            # ===== Scope selection (safe on rerun) =====
             st.markdown("### 🎯 Scope d'analyse")
             match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
             key_scope = f"scope_{rid_full}"
 
-            # If previously selected match no longer exists after filters, reset to global
             prev = st.session_state.get(key_scope, match_options[0])
             if prev not in match_options:
                 st.session_state[key_scope] = match_options[0]
@@ -1187,13 +1336,13 @@ if should_render and st.session_state.analysis_ready:
                 continue
 
             st.success(f"Scope actif: **{scope_label}** • matchs dans le scope: **{len(bundles_use)}**")
+
+            # ✅ Détails match (uniquement si match précis)
             if scope_choice != "Global (tous les matchs)":
-                mi = bundles_use[0]["match"]["info"]
-                dur = int((mi.get("gameDuration", 0) or 0) // 60)
-                st.caption(
-                    f"Match: {scope_choice} • Durée: {dur} min • "
-                    f"Champion: {bundles_use[0]['champion']} • Role: {bundles_use[0]['role']} • Side: {bundles_use[0]['side']}"
-                )
+                try:
+                    render_match_draft_panel(bundles_use[0]["match"], focus_puuid=bundles_use[0]["puuid"])
+                except Exception as e:
+                    st.warning(f"Impossible d'afficher le panneau Draft/Compo pour ce match. Détail: {e}")
 
             # aggregate dfs
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
@@ -1236,7 +1385,6 @@ if should_render and st.session_state.analysis_ready:
 
                 obj_rows.append(objectives_0_15(b["timeline"]))
 
-                # series aligned to max_duration_min (ANTI-CRASH schema)
                 s = ensure_series_schema(b.get("series_full"))
                 if s.empty:
                     continue
@@ -1255,7 +1403,6 @@ if should_render and st.session_state.analysis_ready:
 
                 series_stack.append(s.copy())
 
-                # laning comparisons
                 match = b["match"]
                 tl = b["timeline"]
                 my_pid = participant_id_for_puuid(match, b["puuid"])
@@ -1281,7 +1428,6 @@ if should_render and st.session_state.analysis_ready:
                             if my_snaps[m]["xp"] is not None and ex_snaps[m]["xp"] is not None:
                                 exact_xp_d[m].append(my_snaps[m]["xp"] - ex_snaps[m]["xp"])
 
-                # lobby mean diff @15
                 others_gold, others_xp = [], []
                 for pid in range(1, 11):
                     snaps = get_snapshots_from_timeline(tl, pid, minutes=(15,))
@@ -1296,7 +1442,6 @@ if should_render and st.session_state.analysis_ready:
                 if my_snaps[15]["xp"] is not None and others_xp:
                     lobby_xp_d15.append(my_snaps[15]["xp"] - float(np.mean(others_xp)))
 
-            # concat dfs
             df_0_5 = pd.concat(d0_5_all, ignore_index=True) if d0_5_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
             df_5_10 = pd.concat(d5_10_all, ignore_index=True) if d5_10_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
             df_10_15 = pd.concat(d10_15_all, ignore_index=True) if d10_15_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
@@ -1304,7 +1449,6 @@ if should_render and st.session_state.analysis_ready:
             df_15_30 = pd.concat(d15_30_all, ignore_index=True) if d15_30_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
             df_kills = pd.concat(kills_all_list, ignore_index=True) if kills_all_list else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
 
-            # series mean minute-by-minute (safe)
             if series_stack:
                 series_all = pd.concat(series_stack, ignore_index=True)
                 series_mean = series_all.groupby("minute", as_index=False).mean(numeric_only=True)
@@ -1314,7 +1458,6 @@ if should_render and st.session_state.analysis_ready:
                     {"minute": [0], "gold": [np.nan], "xp": [np.nan], "damage": [np.nan], "cs_total": [np.nan], "cs_per_min_avg": [np.nan], "cs_in_min": [np.nan]}
                 )
 
-            # optional compare series (live)
             compare_series_mean = None
             if compare_puuid and not series_mean.empty:
                 comp_stack = []
@@ -1368,7 +1511,6 @@ if should_render and st.session_state.analysis_ready:
                     compare_series_mean = comp_all.groupby("minute", as_index=False).mean(numeric_only=True)
                     compare_series_mean["minute"] = compare_series_mean["minute"].astype(int)
 
-            # summaries
             champ = bundles_use[0]["champion"]
             role = bundles_use[0]["role"]
 
@@ -1396,7 +1538,6 @@ if should_render and st.session_state.analysis_ready:
             zoneMid_counts = pd.concat(zoneMid_list, ignore_index=True).value_counts() if zoneMid_list else pd.Series(dtype=int)
             obj_df = pd.concat(obj_rows, ignore_index=True) if obj_rows else pd.DataFrame()
 
-            # Tabs
             t_overview, t_laning, t_macro, t_kills, t_export = st.tabs(["📍 Overview", "⚔️ Laning", "🧭 Macro", "☠️ Kills Heatmap", "📄 Export"])
 
             with t_overview:
@@ -1410,11 +1551,6 @@ if should_render and st.session_state.analysis_ready:
                     f"<div class='card'><b>Profil</b> : {champ} • {role} • Scope: <b>{scope_label}</b></div>",
                     unsafe_allow_html=True,
                 )
-
-                if compare_player_text.strip() and compare_puuid is None:
-                    st.warning("Comparaison: Riot ID invalide ou introuvable.")
-                elif compare_puuid and compare_series_mean is None:
-                    st.warning("Comparaison activée mais aucune donnée overlay (joueur non présent / aucun match / rate-limit).")
 
                 st.divider()
                 left, right = st.columns([1.35, 1])
@@ -1465,21 +1601,16 @@ if should_render and st.session_state.analysis_ready:
 
                 with right:
                     st.markdown("#### Courbes minute-par-minute (entiers)")
-
                     if compare_series_mean is not None:
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "gold", "Gold — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "xp", "XP — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "damage", "Dégâts — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "cs_per_min_avg", "CS/min (moyen) — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "cs_in_min", "CS gagnés/min — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                     else:
                         st.plotly_chart(plot_compare_line(series_mean, None, "gold", "Gold", rid_full, ""), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, None, "xp", "XP", rid_full, ""), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, None, "damage", "Dégâts", rid_full, ""), use_container_width=True)
-
-                    st.markdown("#### CS/min")
-                    if compare_series_mean is not None:
-                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "cs_per_min_avg", "CS/min (moyen) — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
-                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "cs_in_min", "CS gagnés/min — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
-                    else:
                         st.plotly_chart(plot_compare_line(series_mean, None, "cs_per_min_avg", "CS/min (moyen)", rid_full, ""), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, None, "cs_in_min", "CS gagnés/min", rid_full, ""), use_container_width=True)
 
@@ -1578,7 +1709,12 @@ if should_render and st.session_state.analysis_ready:
                     os.makedirs("exports", exist_ok=True)
                     pdf_path = os.path.join("exports", f"{rid_full.replace('#', '_')}_{safe_scope}_report.pdf")
 
-                    meta = {"champion": champ, "role": role, "queue": ("SCRIM" if analysis_settings.get("scrim_mode", False) else analysis_settings.get("queue_label", "—")), "scope": safe_scope}
+                    meta = {
+                        "champion": champ,
+                        "role": role,
+                        "queue": ("SCRIM" if analysis_settings.get("scrim_mode", False) else analysis_settings.get("queue_label", "—")),
+                        "scope": safe_scope,
+                    }
 
                     build_player_pdf(
                         out_path=pdf_path,
