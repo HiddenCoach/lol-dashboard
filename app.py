@@ -19,6 +19,20 @@ from reportlab.lib.styles import getSampleStyleSheet
 
 
 # =========================
+# Session state init (anti "page vide" sur rerun)
+# =========================
+if "analysis_ready" not in st.session_state:
+    st.session_state.analysis_ready = False
+
+if "analysis_payload" not in st.session_state:
+    st.session_state.analysis_payload = {}
+
+def set_analysis_payload(payload: dict):
+    st.session_state.analysis_payload = payload
+    st.session_state.analysis_ready = True
+
+
+# =========================
 # Riot routing
 # =========================
 EUW_REGIONAL = "europe"  # match-v5 / account-v1 (regional routing)
@@ -95,6 +109,18 @@ class RiotClient:
     def get_timeline(self, match_id: str) -> Dict[str, Any]:
         url = f"https://{EUW_REGIONAL}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
         return self._get(url)
+
+
+# =========================
+# Cached Riot ID -> PUUID
+# =========================
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 3)
+def cached_puuid(game: str, tag: str) -> Optional[str]:
+    try:
+        client = RiotClient()
+        return client.get_puuid_by_riot_id(game, tag)
+    except Exception:
+        return None
 
 
 # =========================
@@ -572,10 +598,6 @@ REQUIRED_SERIES_COLS = ["minute", "gold", "xp", "damage", "cs_total", "cs_per_mi
 
 
 def ensure_series_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Empêche les crashes si le cache contient une vieille version de series_full
-    (colonnes manquantes). Remplit les colonnes manquantes par NaN.
-    """
     if df is None or df.empty:
         return pd.DataFrame({c: [] for c in REQUIRED_SERIES_COLS})
 
@@ -585,7 +607,6 @@ def ensure_series_schema(df: pd.DataFrame) -> pd.DataFrame:
             d[c] = np.nan
 
     d["minute"] = pd.to_numeric(d["minute"], errors="coerce").fillna(0).astype(int)
-
     for c in ["gold", "xp", "damage", "cs_total", "cs_per_min_avg", "cs_in_min"]:
         d[c] = pd.to_numeric(d[c], errors="coerce")
 
@@ -608,8 +629,10 @@ def plot_compare_line(series_a: pd.DataFrame, series_b: Optional[pd.DataFrame], 
     return fig
 
 
-def series_for_player_in_match(client: RiotClient, match_id: str, puuid: str) -> Optional[pd.DataFrame]:
+@st.cache_data(show_spinner=False, ttl=60 * 20)
+def cached_series_for_player_in_match(match_id: str, puuid: str) -> Optional[pd.DataFrame]:
     try:
+        client = RiotClient()
         match = client.get_match(match_id)
         tl = client.get_timeline(match_id)
     except Exception:
@@ -785,7 +808,13 @@ def build_player_pdf(
     story.append(PageBreak())
 
     story.append(Paragraph("<b>Courbes</b> (minute par minute)", styles["Heading2"]))
-    for col, title in [("gold", "Gold"), ("xp", "XP"), ("damage", "Dégâts (metric)"), ("cs_per_min_avg", "CS/min (moyen)")]:
+    for col, title in [
+        ("gold", "Gold"),
+        ("xp", "XP"),
+        ("damage", "Dégâts (metric)"),
+        ("cs_per_min_avg", "CS/min (moyen)"),
+        ("cs_in_min", "CS gagnés/min"),
+    ]:
         if col not in series_mean.columns:
             continue
         fig = plt.figure(figsize=(6.4, 3.0))
@@ -828,7 +857,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 )
 
 st.title("Heatmap et Data, par Hidden Analyst Coach NT")
-st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), comparaison optionnelle, sélection match précis")
+st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), comparaison optionnelle, sélection match précis (sans page vide)")
 
 
 with st.sidebar:
@@ -849,7 +878,7 @@ with st.sidebar:
     queue_label = st.selectbox("Queue", list(QUEUE_MAP.keys()), index=1, disabled=scrim_mode)
     queue_val = QUEUE_MAP[queue_label] if not scrim_mode else None
 
-    st.header("Filtres")
+    st.header("Filtres (live)")
     filter_role = st.multiselect("Rôle", ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"], default=[])
     filter_side = st.multiselect("Side (optionnel)", ["BLUE", "RED"], default=[])
     filter_champ = st.text_input("Champion (exact, optionnel)")
@@ -868,8 +897,6 @@ with st.sidebar:
         "Mode comparaison",
         ["Même matchs (si présent)", "Ses matchs récents"],
         index=0,
-        help="Même matchs = overlay uniquement quand l'autre joueur est présent dans le même match. "
-        "Ses matchs récents = overlay sur son propre historique.",
     )
     compare_match_count = st.slider("Nb matchs (joueur comparé)", 1, 30, 10)
 
@@ -885,9 +912,18 @@ with st.sidebar:
     st.divider()
     if st.button("🧹 Reset cache (si ça plante / ancienne version)"):
         st.cache_data.clear()
+        st.session_state.analysis_ready = False
+        st.session_state.analysis_payload = {}
+        # aussi reset les scopes pour éviter index invalides
+        for k in list(st.session_state.keys()):
+            if str(k).startswith("scope_"):
+                del st.session_state[k]
         st.rerun()
 
     run = st.button("Analyser (EUW)")
+
+    if st.session_state.analysis_ready:
+        st.caption("✅ Analyse chargée : tu peux changer match précis / filtres sans re-cliquer Analyser.")
 
 
 def pass_filters(bundle) -> bool:
@@ -1007,7 +1043,13 @@ def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: in
     return bundles
 
 
+# =========================
+# MAIN EXEC (no blank page)
+# =========================
+should_render = run or st.session_state.analysis_ready
+
 if run:
+    # fetch + store in session_state
     try:
         minimap = fetch_minimap_image()
     except Exception as e:
@@ -1021,24 +1063,10 @@ if run:
         st.error("Scrim mode activé: ajoute au moins un Match ID dans la sidebar.")
         st.stop()
 
-    opponent_puuid = None
-    if exact_opponent_text and "#" in exact_opponent_text:
-        try:
-            g, t = exact_opponent_text.split("#", 1)
-            opponent_puuid = client.get_puuid_by_riot_id(g.strip(), t.strip())
-        except Exception:
-            opponent_puuid = None
-
-    compare_puuid = None
-    compare_label = None
-    if compare_player_text and "#" in compare_player_text:
-        try:
-            cg, ct = compare_player_text.split("#", 1)
-            compare_puuid = client.get_puuid_by_riot_id(cg.strip(), ct.strip())
-            compare_label = compare_player_text.strip()
-        except Exception:
-            compare_puuid = None
-            compare_label = None
+    players = parse_riot_ids(riot_ids_text)
+    if not players:
+        st.error("Ajoute au moins un Riot ID valide (GameName#TAG).")
+        st.stop()
 
     team_vs = None
     if enable_team_vs:
@@ -1052,12 +1080,64 @@ if run:
                 scrim_match_ids=scrim_match_ids if scrim_mode else None,
             )
 
-    players = parse_riot_ids(riot_ids_text)
-    if not players:
-        st.error("Ajoute au moins un Riot ID valide (GameName#TAG).")
-        st.stop()
+    bundles_by_player = {}
+    with st.spinner("Téléchargement matchs + timelines (tous joueurs)..."):
+        for rid_full, game, tag in players:
+            if scrim_mode:
+                bundles = fetch_player_bundle_by_match_list(rid_full, game, tag, scrim_match_ids)
+            else:
+                bundles = fetch_player_bundle_normal(rid_full, game, tag, match_count, queue_val)
+            bundles_by_player[rid_full] = bundles
 
-    if enable_team_vs:
+    set_analysis_payload(
+        {
+            "minimap": minimap,
+            "players": players,
+            "bundles_by_player": bundles_by_player,
+            "team_vs": team_vs,
+            "analysis_settings": {
+                "scrim_mode": scrim_mode,
+                "queue_label": queue_label,
+                "queue_val": queue_val,
+                "match_count": match_count,
+                "enable_team_vs": enable_team_vs,
+                "team_match_count": team_match_count,
+            },
+        }
+    )
+
+if should_render and st.session_state.analysis_ready:
+    payload = st.session_state.analysis_payload
+    minimap = payload["minimap"]
+    players = payload["players"]
+    bundles_by_player = payload["bundles_by_player"]
+    team_vs = payload.get("team_vs")
+    analysis_settings = payload.get("analysis_settings", {})
+
+    # Live resolve optional IDs (so you can type them without re-Analyser)
+    client_live = RiotClient()
+
+    opponent_puuid = None
+    if exact_opponent_text and "#" in exact_opponent_text:
+        try:
+            g, t = exact_opponent_text.split("#", 1)
+            opponent_puuid = cached_puuid(g.strip(), t.strip())
+        except Exception:
+            opponent_puuid = None
+
+    compare_puuid = None
+    compare_label = None
+    if compare_player_text and "#" in compare_player_text:
+        try:
+            cg, ct = compare_player_text.split("#", 1)
+            compare_puuid = cached_puuid(cg.strip(), ct.strip())
+            compare_label = compare_player_text.strip()
+        except Exception:
+            compare_puuid = None
+            compare_label = None
+
+    # Team vs section
+    if analysis_settings.get("enable_team_vs", False):
         st.markdown("## 👥 Team A vs Team B (option)")
         if team_vs and team_vs.get("error"):
             st.error(team_vs["error"])
@@ -1068,12 +1148,6 @@ if run:
             c2.metric("Team B Gold@15", f"{team_vs['B']['gold15_mean']:.0f}" if team_vs["B"]["gold15_mean"] is not None else "—")
             c3.metric("Team A morts 0–15", f"{team_vs['A']['deaths0_mean']:.2f}" if team_vs["A"]["deaths0_mean"] is not None else "—")
             c4.metric("Team B morts 0–15", f"{team_vs['B']['deaths0_mean']:.2f}" if team_vs["B"]["deaths0_mean"] is not None else "—")
-
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Team A XP@15", f"{team_vs['A']['xp15_mean']:.0f}" if team_vs["A"]["xp15_mean"] is not None else "—")
-            d2.metric("Team B XP@15", f"{team_vs['B']['xp15_mean']:.0f}" if team_vs["B"]["xp15_mean"] is not None else "—")
-            d3.metric("Team A morts 15–30", f"{team_vs['A']['deathsMid_mean']:.2f}" if team_vs["A"]["deathsMid_mean"] is not None else "—")
-            d4.metric("Team B morts 15–30", f"{team_vs['B']['deathsMid_mean']:.2f}" if team_vs["B"]["deathsMid_mean"] is not None else "—")
         st.divider()
 
     tabs_players = st.tabs([p[0] for p in players])
@@ -1082,31 +1156,28 @@ if run:
         with tab:
             st.subheader(f"Joueur : {rid_full}")
 
-            with st.spinner("Récupération matchs + timelines..."):
-                if scrim_mode:
-                    bundles = fetch_player_bundle_by_match_list(rid_full, game, tag, scrim_match_ids)
-                else:
-                    bundles = fetch_player_bundle_normal(rid_full, game, tag, match_count, queue_val)
-
+            bundles = bundles_by_player.get(rid_full, [])
             bundles_f = [b for b in bundles if pass_filters(b)]
             bundles_f = bundles_f[:max_samples]
-            st.caption(f"Matchs inclus (après filtres): {len(bundles_f)}")
 
+            st.caption(f"Matchs inclus (après filtres): {len(bundles_f)}")
             if not bundles_f:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
 
-            # ===== Scope selection (SOURCE OF TRUTH = bundles_use) =====
+            # ===== Scope selection (safe on rerun) =====
             st.markdown("### 🎯 Scope d'analyse")
             match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
+            key_scope = f"scope_{rid_full}"
 
-            scope_choice = st.selectbox(
-                "Choisir : Global ou un match précis",
-                match_options,
-                index=0,
-                key=f"scope_{rid_full}",
-                help="Global = agrégation sur tous les matchs. Match précis = mêmes données mais uniquement sur ce match.",
-            )
+            # If previously selected match no longer exists after filters, reset to global
+            prev = st.session_state.get(key_scope, match_options[0])
+            if prev not in match_options:
+                st.session_state[key_scope] = match_options[0]
+                prev = match_options[0]
+
+            idx = match_options.index(prev) if prev in match_options else 0
+            scope_choice = st.selectbox("Choisir : Global ou un match précis", match_options, index=idx, key=key_scope)
 
             scope_label = "Global" if scope_choice == "Global (tous les matchs)" else scope_choice
             bundles_use = bundles_f if scope_choice == "Global (tous les matchs)" else [b for b in bundles_f if b["matchId"] == scope_choice]
@@ -1127,7 +1198,6 @@ if run:
             # aggregate dfs
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
             kills_all_list = []
-
             zone0_list, zoneMid_list = [], []
             obj_rows = []
 
@@ -1143,7 +1213,6 @@ if run:
             deaths0_count, deathsMid_count = [], []
 
             for b in bundles_use:
-                # dfs
                 for src, acc in [
                     (b["d_0_5"], d0_5_all),
                     (b["d_5_10"], d5_10_all),
@@ -1167,9 +1236,8 @@ if run:
 
                 obj_rows.append(objectives_0_15(b["timeline"]))
 
-                # ===== series aligned to max_duration_min (ANTI-CRASH schema) =====
+                # series aligned to max_duration_min (ANTI-CRASH schema)
                 s = ensure_series_schema(b.get("series_full"))
-
                 if s.empty:
                     continue
 
@@ -1228,7 +1296,7 @@ if run:
                 if my_snaps[15]["xp"] is not None and others_xp:
                     lobby_xp_d15.append(my_snaps[15]["xp"] - float(np.mean(others_xp)))
 
-            # concat
+            # concat dfs
             df_0_5 = pd.concat(d0_5_all, ignore_index=True) if d0_5_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
             df_5_10 = pd.concat(d5_10_all, ignore_index=True) if d5_10_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
             df_10_15 = pd.concat(d10_15_all, ignore_index=True) if d10_15_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
@@ -1243,25 +1311,17 @@ if run:
                 series_mean["minute"] = series_mean["minute"].astype(int)
             else:
                 series_mean = pd.DataFrame(
-                    {
-                        "minute": [0],
-                        "gold": [np.nan],
-                        "xp": [np.nan],
-                        "damage": [np.nan],
-                        "cs_total": [np.nan],
-                        "cs_per_min_avg": [np.nan],
-                        "cs_in_min": [np.nan],
-                    }
+                    {"minute": [0], "gold": [np.nan], "xp": [np.nan], "damage": [np.nan], "cs_total": [np.nan], "cs_per_min_avg": [np.nan], "cs_in_min": [np.nan]}
                 )
 
-            # optional compare series
+            # optional compare series (live)
             compare_series_mean = None
-            if compare_puuid and not series_mean.empty and "minute" in series_mean.columns:
+            if compare_puuid and not series_mean.empty:
                 comp_stack = []
 
                 if compare_mode == "Même matchs (si présent)":
                     for b in bundles_use:
-                        s2 = series_for_player_in_match(client, b["matchId"], compare_puuid)
+                        s2 = cached_series_for_player_in_match(b["matchId"], compare_puuid)
                         if s2 is None or s2.empty:
                             continue
                         s2 = ensure_series_schema(s2)
@@ -1277,16 +1337,15 @@ if run:
                             s2 = pd.concat([s2, extra2], ignore_index=True)
                         else:
                             s2 = s2[s2["minute"] <= int(max_duration_min)]
-
                         comp_stack.append(s2)
                 else:
                     try:
-                        mids2 = client.get_match_ids_by_puuid(compare_puuid, count=compare_match_count, queue=queue_val)
+                        mids2 = client_live.get_match_ids_by_puuid(compare_puuid, count=compare_match_count, queue=queue_val)
                     except Exception:
                         mids2 = []
 
                     for mid2 in mids2:
-                        s2 = series_for_player_in_match(client, mid2, compare_puuid)
+                        s2 = cached_series_for_player_in_match(mid2, compare_puuid)
                         if s2 is None or s2.empty:
                             continue
                         s2 = ensure_series_schema(s2)
@@ -1302,7 +1361,6 @@ if run:
                             s2 = pd.concat([s2, extra2], ignore_index=True)
                         else:
                             s2 = s2[s2["minute"] <= int(max_duration_min)]
-
                         comp_stack.append(s2)
 
                 if comp_stack:
@@ -1310,6 +1368,7 @@ if run:
                     compare_series_mean = comp_all.groupby("minute", as_index=False).mean(numeric_only=True)
                     compare_series_mean["minute"] = compare_series_mean["minute"].astype(int)
 
+            # summaries
             champ = bundles_use[0]["champion"]
             role = bundles_use[0]["role"]
 
@@ -1337,6 +1396,7 @@ if run:
             zoneMid_counts = pd.concat(zoneMid_list, ignore_index=True).value_counts() if zoneMid_list else pd.Series(dtype=int)
             obj_df = pd.concat(obj_rows, ignore_index=True) if obj_rows else pd.DataFrame()
 
+            # Tabs
             t_overview, t_laning, t_macro, t_kills, t_export = st.tabs(["📍 Overview", "⚔️ Laning", "🧭 Macro", "☠️ Kills Heatmap", "📄 Export"])
 
             with t_overview:
@@ -1347,8 +1407,7 @@ if run:
                 c4.metric("XP@15 vs lobby", f"{lobby_xp_diff_15:.0f}" if lobby_xp_diff_15 is not None else "—")
 
                 st.markdown(
-                    f"<div class='card'><b>Profil</b> : {champ} • {role} • Mode: {'SCRIM' if scrim_mode else 'NORMAL'} • "
-                    f"{('—' if scrim_mode else queue_label)} • <b>Scope:</b> {scope_label}</div>",
+                    f"<div class='card'><b>Profil</b> : {champ} • {role} • Scope: <b>{scope_label}</b></div>",
                     unsafe_allow_html=True,
                 )
 
@@ -1358,7 +1417,6 @@ if run:
                     st.warning("Comparaison activée mais aucune donnée overlay (joueur non présent / aucun match / rate-limit).")
 
                 st.divider()
-
                 left, right = st.columns([1.35, 1])
 
                 with left:
@@ -1411,15 +1469,11 @@ if run:
                     if compare_series_mean is not None:
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "gold", "Gold — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                         st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "xp", "XP — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
-                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "damage", "Dégâts (metric) — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "damage", "Dégâts — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
                     else:
-                        plot_df = series_mean.set_index("minute")[["gold", "xp", "damage"]]
-                        st.line_chart(plot_df[["gold"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = Gold")
-                        st.line_chart(plot_df[["xp"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = XP")
-                        st.line_chart(plot_df[["damage"]], height=170)
-                        st.caption("x = minute entière (0,1,2,...) • y = Dégâts (metric)")
+                        st.plotly_chart(plot_compare_line(series_mean, None, "gold", "Gold", rid_full, ""), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, None, "xp", "XP", rid_full, ""), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, None, "damage", "Dégâts", rid_full, ""), use_container_width=True)
 
                     st.markdown("#### CS/min")
                     if compare_series_mean is not None:
@@ -1430,7 +1484,7 @@ if run:
                         st.plotly_chart(plot_compare_line(series_mean, None, "cs_in_min", "CS gagnés/min", rid_full, ""), use_container_width=True)
 
                     st.markdown("#### Durée max analysée")
-                    st.metric("Max minute (match le plus long)", f"{int(series_mean['minute'].max())} min")
+                    st.metric("Max minute (match le plus long du scope)", f"{int(series_mean['minute'].max())} min")
 
             with t_laning:
                 st.markdown("### Review Laning (vs matchup direct = même rôle)")
@@ -1455,10 +1509,10 @@ if run:
                     ex1.metric("XP diff @5", f"{exact_xp_diff_5:.0f}" if exact_xp_diff_5 is not None else "—")
                     ex2.metric("XP diff @10", f"{exact_xp_diff_10:.0f}" if exact_xp_diff_10 is not None else "—")
                     ex3.metric("XP diff @15", f"{exact_xp_diff_15:.0f}" if exact_xp_diff_15 is not None else "—")
-                    st.caption("Affiché seulement si cet adversaire est présent dans les matchs analysés (scope actuel).")
+                    st.caption("Affiché seulement si cet adversaire est présent dans les matchs du scope actuel.")
 
             with t_macro:
-                st.markdown("### Macro & Rotations — zones role-aware (corrige toplane vs topside)")
+                st.markdown("### Macro & Rotations — zones role-aware")
                 z1, z2 = st.columns(2)
                 with z1:
                     st.markdown("#### Zones deaths Early (0–15)")
@@ -1524,7 +1578,7 @@ if run:
                     os.makedirs("exports", exist_ok=True)
                     pdf_path = os.path.join("exports", f"{rid_full.replace('#', '_')}_{safe_scope}_report.pdf")
 
-                    meta = {"champion": champ, "role": role, "queue": ("SCRIM" if scrim_mode else queue_label), "scope": safe_scope}
+                    meta = {"champion": champ, "role": role, "queue": ("SCRIM" if analysis_settings.get("scrim_mode", False) else analysis_settings.get("queue_label", "—")), "scope": safe_scope}
 
                     build_player_pdf(
                         out_path=pdf_path,
@@ -1547,3 +1601,6 @@ if run:
                             mime="application/pdf",
                             key=f"dl_{rid_full}_{safe_scope}",
                         )
+
+else:
+    st.info("➡️ Renseigne tes joueurs et clique **Analyser (EUW)**.")
