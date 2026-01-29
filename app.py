@@ -944,6 +944,14 @@ if run:
 
     client = RiotClient()
 
+compare_puuid = None
+if compare_player_text and "#" in compare_player_text:
+    try:
+        cg, ct = compare_player_text.split("#", 1)
+        compare_puuid = client.get_puuid_by_riot_id(cg.strip(), ct.strip())
+    except Exception:
+        compare_puuid = None
+
     # scrim match ids
     scrim_match_ids = parse_match_ids(scrim_match_ids_text) if scrim_mode else None
     if scrim_mode and not scrim_match_ids:
