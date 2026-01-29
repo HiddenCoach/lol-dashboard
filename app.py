@@ -142,7 +142,6 @@ def parse_match_ids(text: str) -> List[str]:
         line = line.strip()
         if not line:
             continue
-        # match-v5 IDs look like: EUW1_123... (still on europe regional)
         out.append(line)
     return out
 
@@ -266,7 +265,7 @@ def extract_deaths_window(
             "minute": float(t_min),
             "x": x,
             "y": y,
-            "side": side,      # per match => blue/red points correct even when mixed
+            "side": side,
             "role": role,
             "zone": role_aware_zone(x, y, role),
         })
@@ -329,15 +328,17 @@ def get_snapshots_from_timeline(timeline: Dict[str, Any], pid: int, minutes=(5, 
 def timeline_series_full_minutes(timeline: Dict[str, Any], pid: int, max_min: int) -> pd.DataFrame:
     """
     FULL match series, minute by minute INTEGERS only (0..max_min)
-    values forward-filled (cumulative style)
+    Includes: gold, xp, damage, cs_total, cs_per_min_avg, cs_in_min
     """
     frames = timeline["info"]["frames"]
-    minute_rows = {}  # minute -> {gold,xp,damage}
+    minute_rows = {}
+
     for idx, fr in enumerate(frames):
         t_ms = fr.get("timestamp", idx * 60000)
-        m = int(t_ms // 60000)  # integer minute
+        m = int(t_ms // 60000)
         if m > max_min:
             break
+
         pf = fr.get("participantFrames", {}).get(str(pid))
         if not pf:
             continue
@@ -345,30 +346,39 @@ def timeline_series_full_minutes(timeline: Dict[str, Any], pid: int, max_min: in
         gold = pf.get("totalGold")
         xp = pf.get("xp")
 
-        dmg = None
+        dmg = np.nan
         dmg_stats = pf.get("damageStats") or {}
         for k in ["totalDamageDoneToChampions", "damageDealtToChampions", "totalDamageDone"]:
             if k in dmg_stats:
-                dmg = dmg_stats[k]
+                dmg = float(dmg_stats[k])
                 break
+
+        lane_cs = pf.get("minionsKilled", 0) or 0
+        jg_cs = pf.get("jungleMinionsKilled", 0) or 0
+        cs_total = float(lane_cs + jg_cs)
 
         minute_rows[m] = {
             "minute": m,
             "gold": float(gold) if gold is not None else np.nan,
             "xp": float(xp) if xp is not None else np.nan,
-            "damage": float(dmg) if dmg is not None else np.nan,
+            "damage": dmg,
+            "cs_total": cs_total,
         }
 
-    # build full minutes + forward fill
     df = pd.DataFrame({"minute": list(range(0, max_min + 1))})
     if minute_rows:
         df2 = pd.DataFrame(list(minute_rows.values()))
         df = df.merge(df2, on="minute", how="left")
-        df[["gold", "xp", "damage"]] = df[["gold", "xp", "damage"]].ffill()
+        df[["gold", "xp", "damage", "cs_total"]] = df[["gold", "xp", "damage", "cs_total"]].ffill()
     else:
         df["gold"] = np.nan
         df["xp"] = np.nan
         df["damage"] = np.nan
+        df["cs_total"] = np.nan
+
+    df["cs_per_min_avg"] = np.where(df["minute"] > 0, df["cs_total"] / df["minute"], 0.0)
+    df["cs_in_min"] = df["cs_total"].diff().fillna(df["cs_total"]).clip(lower=0)
+
     return df
 
 
@@ -525,6 +535,54 @@ def fig_to_png_bytes(fig) -> bytes:
     return buf.getvalue()
 
 
+def mean_safe(values):
+    clean = [
+        v for v in values
+        if v is not None and not (isinstance(v, float) and np.isnan(v))
+    ]
+    if not clean:
+        return None
+    return float(np.mean(clean))
+
+
+def fmt(v: Optional[float], digits: int = 0) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    return f"{v:.{digits}f}"
+
+
+def plot_compare_line(series_a: pd.DataFrame, series_b: Optional[pd.DataFrame], y: str, title: str, name_a="Joueur", name_b="Comparé"):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=series_a["minute"], y=series_a[y], mode="lines", name=name_a))
+    if series_b is not None and not series_b.empty:
+        fig.add_trace(go.Scatter(x=series_b["minute"], y=series_b[y], mode="lines", name=name_b))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Temps (minutes entières)",
+        yaxis_title=y,
+        height=300,
+        margin=dict(l=10, r=10, t=45, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01),
+    )
+    return fig
+
+
+def series_for_player_in_match(client: RiotClient, match_id: str, puuid: str) -> Optional[pd.DataFrame]:
+    try:
+        match = client.get_match(match_id)
+        tl = client.get_timeline(match_id)
+    except Exception:
+        return None
+
+    pid = find_pid_by_puuid(match, puuid)
+    if not pid:
+        return None
+
+    dur_s = match["info"].get("gameDuration", 0) or 0
+    max_min = int(dur_s // 60)
+    return timeline_series_full_minutes(tl, pid, max_min=max_min)
+
+
 # =========================
 # Team A vs Team B
 # =========================
@@ -541,7 +599,6 @@ def resolve_team_puuids(client: RiotClient, team_text: str) -> Dict[str, str]:
 
 @st.cache_data(show_spinner=False, ttl=60 * 20)
 def candidate_match_ids_from_team(client: RiotClient, team_puuids: List[str], count_per_player: int, queue_val: Optional[int]) -> List[str]:
-    # union matches from first 2 players to limit API cost
     match_ids = set()
     for puuid in team_puuids[:2]:
         mids = client.get_match_ids_by_puuid(puuid, count=count_per_player, queue=queue_val)
@@ -567,7 +624,6 @@ def compute_teamA_vs_teamB(
     teamA_set = set(teamA.values())
     teamB_set = set(teamB.values())
 
-    # candidates
     if scrim_match_ids:
         candidates = scrim_match_ids[:count_matches]
     else:
@@ -590,14 +646,11 @@ def compute_teamA_vs_teamB(
         participants = match["info"]["participants"]
         presentA = [p for p in participants if p.get("puuid") in teamA_set]
         presentB = [p for p in participants if p.get("puuid") in teamB_set]
-
-        # require meaningful presence (scrim): at least 3 each
         if len(presentA) < 3 or len(presentB) < 3:
             continue
 
         used += 1
 
-        # compute per participant quick metrics (gold/xp@15 + deaths early/mid)
         for pid in range(1, 11):
             meta = participant_meta_by_pid(match, pid)
             p_puuid = meta["puuid"]
@@ -663,12 +716,11 @@ def build_player_pdf(
 
     story.append(Paragraph(f"<b>Rapport Coach</b> — {player_label}", styles["Title"]))
     story.append(Paragraph(
-        f"Champion: {meta.get('champion','—')} | Rôle: {meta.get('role','—')} | Queue: {meta.get('queue','—')}",
+        f"Champion: {meta.get('champion','—')} | Rôle: {meta.get('role','—')} | Queue: {meta.get('queue','—')} | Scope: {meta.get('scope','Global')}",
         styles["Normal"]
     ))
     story.append(Spacer(1, 10))
 
-    # Death heatmaps
     f1 = minimap_heatmap_matplotlib(minimap, deaths_0_15, "Heatmap morts — Early (0–15)")
     if f1:
         story.append(RLImage(io.BytesIO(fig_to_png_bytes(f1)), width=420, height=420))
@@ -679,16 +731,16 @@ def build_player_pdf(
         story.append(RLImage(io.BytesIO(fig_to_png_bytes(f2)), width=420, height=420))
         story.append(Spacer(1, 8))
 
-    # Kills heatmap
     f3 = minimap_heatmap_matplotlib(minimap, kills_all, "Heatmap kills — positions (toutes fenêtres)")
     if f3:
         story.append(RLImage(io.BytesIO(fig_to_png_bytes(f3)), width=420, height=420))
 
     story.append(PageBreak())
 
-    # Series (minute integers)
     story.append(Paragraph("<b>Courbes</b> (minute par minute)", styles["Heading2"]))
-    for col, title in [("gold", "Gold"), ("xp", "XP"), ("damage", "Dégâts (metric)")]:
+    for col, title in [("gold", "Gold"), ("xp", "XP"), ("damage", "Dégâts (metric)"), ("cs_per_min_avg", "CS/min (moyen)")]:
+        if col not in series_mean.columns:
+            continue
         fig = plt.figure(figsize=(6.4, 3.0))
         plt.plot(series_mean["minute"], series_mean[col])
         plt.title(f"{title} — moyenne")
@@ -726,7 +778,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 """, unsafe_allow_html=True)
 
 st.title("Heatmap et Data, par Hidden Analyst Coach NT")
-st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), comparaison avec un joueur spécifique")
+st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), comparaison optionnelle, sélection match précis")
 
 with st.sidebar:
     st.header("Mode")
@@ -759,6 +811,17 @@ with st.sidebar:
     st.header("Options laning (optionnel)")
     exact_opponent_text = st.text_input("Adversaire exact Riot ID (GameName#TAG)")
 
+    st.header("Comparaison joueur (optionnel)")
+    compare_player_text = st.text_input("Comparer avec Riot ID (GameName#TAG)", value="")
+    compare_mode = st.radio(
+        "Mode comparaison",
+        ["Même matchs (si présent)", "Ses matchs récents"],
+        index=0,
+        help="Même matchs = overlay uniquement quand l'autre joueur est présent dans le même match. "
+             "Ses matchs récents = overlay sur son propre historique."
+    )
+    compare_match_count = st.slider("Nb matchs (joueur comparé)", 1, 30, 10)
+
     st.header("Team A vs Team B (optionnel)")
     enable_team_vs = st.checkbox("Activer Team A vs Team B", value=False)
     teamA_text = st.text_area("Team A (5 lignes, GameName#TAG)", height=100, disabled=(not enable_team_vs))
@@ -783,9 +846,6 @@ def pass_filters(bundle) -> bool:
 
 @st.cache_data(show_spinner=False, ttl=60 * 20)
 def fetch_player_bundle_by_match_list(riot_id_full: str, game: str, tag: str, match_ids: List[str]):
-    """
-    Scrim mode: analyse ONLY given match IDs
-    """
     client = RiotClient()
     puuid = client.get_puuid_by_riot_id(game, tag)
 
@@ -796,27 +856,23 @@ def fetch_player_bundle_by_match_list(riot_id_full: str, game: str, tag: str, ma
 
         pid = find_pid_by_puuid(match, puuid)
         if not pid:
-            continue  # player not in this custom match
+            continue
 
         meta = participant_meta(match, puuid)
         champ = meta["championName"]
         role = meta["teamPosition"]
         side = meta["side"]
 
-        # windows deaths
         d_0_5 = extract_deaths_window(tl, pid, 0.0, 5.0, mid, side, role)
         d_5_10 = extract_deaths_window(tl, pid, 5.0, 10.0, mid, side, role)
         d_10_15 = extract_deaths_window(tl, pid, 10.0, 15.0, mid, side, role)
         d_0_15 = extract_deaths_window(tl, pid, 0.0, 15.0, mid, side, role)
         d_15_30 = extract_deaths_window(tl, pid, 15.0, 30.0, mid, side, role)
 
-        # kills (all match window for heatmap)
         k_all = extract_kills_window(tl, pid, 0.0, 90.0, mid, side, role)
 
-        # duration minutes
         dur_s = match["info"].get("gameDuration", 0) or 0
         max_min = int(dur_s // 60)
-
         series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
 
         bundles.append({
@@ -842,9 +898,6 @@ def fetch_player_bundle_by_match_list(riot_id_full: str, game: str, tag: str, ma
 
 @st.cache_data(show_spinner=False, ttl=60 * 20)
 def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: int, queue_val: Optional[int]):
-    """
-    Normal mode: fetch match ids by puuid
-    """
     client = RiotClient()
     puuid = client.get_puuid_by_riot_id(game, tag)
     match_ids = client.get_match_ids_by_puuid(puuid, count=count, queue=queue_val)
@@ -871,7 +924,6 @@ def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: in
 
         dur_s = match["info"].get("gameDuration", 0) or 0
         max_min = int(dur_s // 60)
-
         series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
 
         bundles.append({
@@ -895,30 +947,7 @@ def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: in
     return bundles
 
 
-def fmt(v: Optional[float], digits: int = 0) -> str:
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return "—"
-    return f"{v:.{digits}f}"
-
-
-def mean_safe(values):
-    """
-    Moyenne robuste :
-    - ignore None
-    - ignore NaN
-    - retourne None si vide
-    """
-    clean = [
-        v for v in values
-        if v is not None and not (isinstance(v, float) and np.isnan(v))
-    ]
-    if not clean:
-        return None
-    return float(np.mean(clean))
-
-
 if run:
-    # minimap
     try:
         minimap = fetch_minimap_image()
     except Exception as e:
@@ -942,6 +971,18 @@ if run:
         except Exception:
             opponent_puuid = None
 
+    # optional compare player
+    compare_puuid = None
+    compare_label = None
+    if compare_player_text and "#" in compare_player_text:
+        try:
+            cg, ct = compare_player_text.split("#", 1)
+            compare_puuid = client.get_puuid_by_riot_id(cg.strip(), ct.strip())
+            compare_label = compare_player_text.strip()
+        except Exception:
+            compare_puuid = None
+            compare_label = None
+
     # optional Team A vs Team B
     team_vs = None
     if enable_team_vs:
@@ -960,7 +1001,6 @@ if run:
         st.error("Ajoute au moins un Riot ID valide (GameName#TAG).")
         st.stop()
 
-    # Global team section (top)
     if enable_team_vs:
         st.markdown("## 👥 Team A vs Team B (option)")
         if team_vs and team_vs.get("error"):
@@ -994,11 +1034,22 @@ if run:
 
             bundles_f = [b for b in bundles if pass_filters(b)]
             bundles_f = bundles_f[:max_samples]
-            st.caption(f"Matchs inclus: {len(bundles_f)}")
+            st.caption(f"Matchs inclus (après filtres): {len(bundles_f)}")
 
             if not bundles_f:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
+
+            # ===== Scope selection: Global vs one match =====
+            st.markdown("### 🎯 Scope d'analyse")
+            match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
+            scope_choice = st.selectbox(
+                "Choisir : Global ou un match précis",
+                match_options,
+                index=0,
+                help="Global = agrégation sur tous les matchs. Match précis = mêmes données mais uniquement sur ce match."
+            )
+            bundles_view = bundles_f if scope_choice == "Global (tous les matchs)" else [b for b in bundles_f if b["matchId"] == scope_choice]
 
             # aggregate dfs (deaths segments + mid + kills)
             d0_5_all, d5_10_all, d10_15_all, d0_15_all, d15_30_all = [], [], [], [], []
@@ -1007,8 +1058,7 @@ if run:
             zone0_list, zoneMid_list = [], []
             obj_rows = []
 
-            # series aggregation up to max duration among matches analyzed
-            max_duration_min = max([b["max_min"] for b in bundles_f])
+            max_duration_min = max([b["max_min"] for b in bundles_view])
             series_stack = []
 
             # laning compare
@@ -1018,11 +1068,9 @@ if run:
             exact_xp_d = {5: [], 10: [], 15: []}
             lobby_gold_d15, lobby_xp_d15 = [], []
 
-            # basic stats
             deaths0_count, deathsMid_count = [], []
 
-            for b in bundles_f:
-                # dfs
+            for b in bundles_view:
                 for src, acc in [
                     (b["d_0_5"], d0_5_all),
                     (b["d_5_10"], d5_10_all),
@@ -1049,23 +1097,24 @@ if run:
                 # series aligned to max_duration_min
                 s = b["series_full"]
                 if s["minute"].max() < max_duration_min:
-                    # extend & ffill
                     last = s.iloc[-1]
                     extra = pd.DataFrame({"minute": range(int(s["minute"].max()) + 1, max_duration_min + 1)})
-                    extra["gold"] = last["gold"]
-                    extra["xp"] = last["xp"]
-                    extra["damage"] = last["damage"]
+                    extra["gold"] = last.get("gold", np.nan)
+                    extra["xp"] = last.get("xp", np.nan)
+                    extra["damage"] = last.get("damage", np.nan)
+                    extra["cs_total"] = last.get("cs_total", np.nan)
+                    extra["cs_per_min_avg"] = last.get("cs_per_min_avg", np.nan)
+                    extra["cs_in_min"] = 0.0
                     s = pd.concat([s, extra], ignore_index=True)
-                series_stack.append(s[["minute", "gold", "xp", "damage"]].copy())
+                series_stack.append(s[["minute", "gold", "xp", "damage", "cs_total", "cs_per_min_avg", "cs_in_min"]].copy())
 
-                # laning comparisons (only if not scrim? still works)
+                # laning comparisons
                 match = b["match"]
                 tl = b["timeline"]
                 my_pid = participant_id_for_puuid(match, b["puuid"])
                 my_role = b["role"]
                 my_snaps = get_snapshots_from_timeline(tl, my_pid, minutes=(5, 10, 15))
 
-                # role-based opponent
                 opp_pid = find_lane_opponent_pid(match, b["puuid"], my_role)
                 if opp_pid:
                     opp_snaps = get_snapshots_from_timeline(tl, opp_pid, minutes=(5, 10, 15))
@@ -1075,7 +1124,6 @@ if run:
                         if my_snaps[m]["xp"] is not None and opp_snaps[m]["xp"] is not None:
                             matchup_xp_d[m].append(my_snaps[m]["xp"] - opp_snaps[m]["xp"])
 
-                # exact opponent (optional)
                 if opponent_puuid:
                     pid_exact = find_pid_by_puuid(match, opponent_puuid)
                     if pid_exact:
@@ -1109,15 +1157,60 @@ if run:
             df_15_30 = pd.concat(d15_30_all, ignore_index=True) if d15_30_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
             df_kills = pd.concat(kills_all_list, ignore_index=True) if kills_all_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
 
-            # series mean minute-by-minute (integers)
+            # series mean minute-by-minute
             series_all = pd.concat(series_stack, ignore_index=True)
             series_mean = series_all.groupby("minute", as_index=False).mean(numeric_only=True)
-            # ensure integer minutes in plot
             series_mean["minute"] = series_mean["minute"].astype(int)
 
-            # summaries
-            champ = bundles_f[0]["champion"]
-            role = bundles_f[0]["role"]
+            # optional compare series
+            compare_series_mean = None
+            if compare_puuid:
+                comp_stack = []
+                if compare_mode == "Même matchs (si présent)":
+                    for b in bundles_view:
+                        s2 = series_for_player_in_match(client, b["matchId"], compare_puuid)
+                        if s2 is None or s2.empty:
+                            continue
+
+                        if s2["minute"].max() < max_duration_min:
+                            last2 = s2.iloc[-1]
+                            extra2 = pd.DataFrame({"minute": range(int(s2["minute"].max()) + 1, max_duration_min + 1)})
+                            for col in ["gold","xp","damage","cs_total","cs_per_min_avg","cs_in_min"]:
+                                extra2[col] = last2.get(col, np.nan)
+                            s2 = pd.concat([s2, extra2], ignore_index=True)
+                        else:
+                            s2 = s2[s2["minute"] <= max_duration_min]
+
+                        comp_stack.append(s2[["minute","gold","xp","damage","cs_total","cs_per_min_avg","cs_in_min"]])
+                else:
+                    try:
+                        mids2 = client.get_match_ids_by_puuid(compare_puuid, count=compare_match_count, queue=queue_val)
+                    except Exception:
+                        mids2 = []
+
+                    for mid2 in mids2:
+                        s2 = series_for_player_in_match(client, mid2, compare_puuid)
+                        if s2 is None or s2.empty:
+                            continue
+
+                        if s2["minute"].max() < max_duration_min:
+                            last2 = s2.iloc[-1]
+                            extra2 = pd.DataFrame({"minute": range(int(s2["minute"].max()) + 1, max_duration_min + 1)})
+                            for col in ["gold","xp","damage","cs_total","cs_per_min_avg","cs_in_min"]:
+                                extra2[col] = last2.get(col, np.nan)
+                            s2 = pd.concat([s2, extra2], ignore_index=True)
+                        else:
+                            s2 = s2[s2["minute"] <= max_duration_min]
+
+                        comp_stack.append(s2[["minute","gold","xp","damage","cs_total","cs_per_min_avg","cs_in_min"]])
+
+                if comp_stack:
+                    comp_all = pd.concat(comp_stack, ignore_index=True)
+                    compare_series_mean = comp_all.groupby("minute", as_index=False).mean(numeric_only=True)
+                    compare_series_mean["minute"] = compare_series_mean["minute"].astype(int)
+
+            champ = bundles_view[0]["champion"]
+            role = bundles_view[0]["role"]
 
             me_deaths0 = float(np.mean(deaths0_count)) if deaths0_count else None
             me_deathsMid = float(np.mean(deathsMid_count)) if deathsMid_count else None
@@ -1143,7 +1236,6 @@ if run:
             zoneMid_counts = pd.concat(zoneMid_list, ignore_index=True).value_counts() if zoneMid_list else pd.Series(dtype=int)
             obj_df = pd.concat(obj_rows, ignore_index=True) if obj_rows else pd.DataFrame()
 
-            # tabs
             t_overview, t_laning, t_macro, t_kills, t_export = st.tabs(
                 ["📍 Overview", "⚔️ Laning", "🧭 Macro", "☠️ Kills Heatmap", "📄 Export"]
             )
@@ -1154,7 +1246,15 @@ if run:
                 c2.metric("Morts 15–30 (moy.)", f"{me_deathsMid:.2f}" if me_deathsMid is not None else "—")
                 c3.metric("Gold@15 vs lobby", f"{lobby_gold_diff_15:.0f}" if lobby_gold_diff_15 is not None else "—")
                 c4.metric("XP@15 vs lobby", f"{lobby_xp_diff_15:.0f}" if lobby_xp_diff_15 is not None else "—")
-                st.markdown(f"<div class='card'><b>Profil</b> : {champ} • {role} • Mode: {'SCRIM' if scrim_mode else 'NORMAL'} • {('—' if scrim_mode else queue_label)}</div>", unsafe_allow_html=True)
+
+                scope_label = "Global" if scope_choice == "Global (tous les matchs)" else scope_choice
+                st.markdown(
+                    f"<div class='card'><b>Profil</b> : {champ} • {role} • Mode: {'SCRIM' if scrim_mode else 'NORMAL'} • {('—' if scrim_mode else queue_label)} • <b>Scope:</b> {scope_label}</div>",
+                    unsafe_allow_html=True
+                )
+                if compare_series_mean is None and compare_player_text.strip():
+                    st.warning("Comparaison activée mais aucune donnée overlay (joueur non trouvé / pas de matchs / rate-limit).")
+
                 st.divider()
 
                 left, right = st.columns([1.35, 1])
@@ -1193,14 +1293,41 @@ if run:
 
                 with right:
                     st.markdown("#### Courbes minute-par-minute (entiers)")
-                    # Ensure minute is index and integer
-                    plot_df = series_mean.set_index("minute")[["gold", "xp", "damage"]]
-                    st.line_chart(plot_df[["gold"]], height=170)
-                    st.caption("x = minute entière (0,1,2,...) • y = Gold")
-                    st.line_chart(plot_df[["xp"]], height=170)
-                    st.caption("x = minute entière (0,1,2,...) • y = XP")
-                    st.line_chart(plot_df[["damage"]], height=170)
-                    st.caption("x = minute entière (0,1,2,...) • y = Dégâts (metric)")
+                    # overlay if compare exists; otherwise show simple charts
+                    if compare_series_mean is not None:
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "gold", "Gold — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "xp", "XP — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                        st.plotly_chart(plot_compare_line(series_mean, compare_series_mean, "damage", "Dégâts (metric) — comparaison", rid_full, compare_label or "Comparé"), use_container_width=True)
+                    else:
+                        plot_df = series_mean.set_index("minute")[["gold", "xp", "damage"]]
+                        st.line_chart(plot_df[["gold"]], height=170)
+                        st.caption("x = minute entière (0,1,2,...) • y = Gold")
+                        st.line_chart(plot_df[["xp"]], height=170)
+                        st.caption("x = minute entière (0,1,2,...) • y = XP")
+                        st.line_chart(plot_df[["damage"]], height=170)
+                        st.caption("x = minute entière (0,1,2,...) • y = Dégâts (metric)")
+
+                    st.markdown("#### CS/min (moyen) — minute par minute")
+                    fig_cs = plot_compare_line(
+                        series_mean,
+                        compare_series_mean,
+                        y="cs_per_min_avg",
+                        title="CS/min (moyen) — comparaison" if compare_series_mean is not None else "CS/min (moyen)",
+                        name_a=rid_full,
+                        name_b=(compare_label or "Comparé")
+                    )
+                    st.plotly_chart(fig_cs, use_container_width=True)
+
+                    st.markdown("#### CS gagnés par minute (delta)")
+                    fig_cs_delta = plot_compare_line(
+                        series_mean,
+                        compare_series_mean,
+                        y="cs_in_min",
+                        title="CS gagnés/min — comparaison" if compare_series_mean is not None else "CS gagnés/min",
+                        name_a=rid_full,
+                        name_b=(compare_label or "Comparé")
+                    )
+                    st.plotly_chart(fig_cs_delta, use_container_width=True)
 
                     st.markdown("#### Durée max analysée")
                     st.metric("Max minute (match le plus long)", f"{int(series_mean['minute'].max())} min")
@@ -1228,7 +1355,7 @@ if run:
                     ex1.metric("XP diff @5", f"{exact_xp_diff_5:.0f}" if exact_xp_diff_5 is not None else "—")
                     ex2.metric("XP diff @10", f"{exact_xp_diff_10:.0f}" if exact_xp_diff_10 is not None else "—")
                     ex3.metric("XP diff @15", f"{exact_xp_diff_15:.0f}" if exact_xp_diff_15 is not None else "—")
-                    st.caption("Affiché seulement si cet adversaire est présent dans les matchs analysés.")
+                    st.caption("Affiché seulement si cet adversaire est présent dans les matchs analysés (scope actuel).")
 
             with t_macro:
                 st.markdown("### Macro & Rotations — zones role-aware (corrige toplane vs topside)")
@@ -1251,7 +1378,7 @@ if run:
                 if obj_df is not None and not obj_df.empty:
                     st.dataframe(obj_df.sort_values("minute").head(250))
                 else:
-                    st.caption("Aucun event objectif détecté 0–15 (selon les matchs).")
+                    st.caption("Aucun event objectif détecté 0–15 (selon le scope).")
 
             with t_kills:
                 st.markdown("### Heatmap des zones où le joueur fait le plus de kills")
@@ -1268,13 +1395,13 @@ if run:
                     figKh = minimap_heatmap_matplotlib(minimap, df_kills, "Heatmap kills (toutes minutes)", gridsize=heat_gridsize)
                     if figKh:
                         st.pyplot(figKh, clear_figure=True)
-                    # zones counts kills
                     if not df_kills.empty:
                         st.markdown("#### Zones kills (role-aware)")
                         st.dataframe(df_kills["zone"].value_counts().rename("kills").to_frame())
 
             with t_export:
-                st.markdown("### Export PDF")
+                st.markdown("### Export PDF (scope actuel)")
+
                 laning_summary = (
                     f"Matchup (moyenne): Gold diff @5={fmt(lane_gold_diff_5)}, @10={fmt(lane_gold_diff_10)}, @15={fmt(lane_gold_diff_15)}. "
                     f"XP diff @5={fmt(lane_xp_diff_5)}, @10={fmt(lane_xp_diff_10)}, @15={fmt(lane_xp_diff_15)}."
@@ -1292,11 +1419,17 @@ if run:
                     f"Events objectifs 0–15: {len(obj_df) if obj_df is not None and not obj_df.empty else 0}."
                 )
 
-                if st.button(f"Générer PDF — {rid_full}", key=f"pdf_{rid_full}"):
+                if st.button(f"Générer PDF — {rid_full} (scope)", key=f"pdf_{rid_full}_{scope_label}"):
                     os.makedirs("exports", exist_ok=True)
-                    pdf_path = os.path.join("exports", f"{rid_full.replace('#', '_')}_report.pdf")
+                    safe_scope = ("Global" if scope_choice == "Global (tous les matchs)" else scope_choice).replace(":", "_")
+                    pdf_path = os.path.join("exports", f"{rid_full.replace('#', '_')}_{safe_scope}_report.pdf")
 
-                    meta = {"champion": champ, "role": role, "queue": ("SCRIM" if scrim_mode else queue_label)}
+                    meta = {
+                        "champion": champ,
+                        "role": role,
+                        "queue": ("SCRIM" if scrim_mode else queue_label),
+                        "scope": safe_scope
+                    }
 
                     build_player_pdf(
                         out_path=pdf_path,
@@ -1317,5 +1450,5 @@ if run:
                             f,
                             file_name=os.path.basename(pdf_path),
                             mime="application/pdf",
-                            key=f"dl_{rid_full}",
+                            key=f"dl_{rid_full}_{safe_scope}",
                         )
