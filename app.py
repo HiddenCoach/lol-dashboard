@@ -725,8 +725,8 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Analyse Heatmap et Data, par Hidden Analyst Coach")
-st.caption("Minimap interactive, heatmaps deaths/kills, laning review, macro, Team A vs Team B, mode scrim (custom), option analyse matchup vs joueur en particulier)")
+st.title("EUW — Coach Dashboard (Pro & Scrim)")
+st.caption("Minimap interactive (points BLUE/RED par match) + heatmaps deaths/kills + laning review + macro + Team A vs Team B + mode scrim (custom).")
 
 with st.sidebar:
     st.header("Mode")
@@ -764,15 +764,6 @@ with st.sidebar:
     teamA_text = st.text_area("Team A (5 lignes, GameName#TAG)", height=100, disabled=(not enable_team_vs))
     teamB_text = st.text_area("Team B (5 lignes, GameName#TAG)", height=100, disabled=(not enable_team_vs))
     team_match_count = st.slider("Team: matchs à scanner", 5, 30, 12, disabled=(not enable_team_vs))
-
-    st.header("Comparaison joueur (optionnel)")
-    compare_player_text = st.text_input("Comparer avec Riot ID (GameName#TAG)")
-    compare_mode = st.radio(
-    "Mode comparaison",
-    ["Même matchs (si présent)", "Ses matchs récents"],
-    index=0
-)
-    compare_match_count = st.slider("Nb matchs pour joueur comparé", 1, 30, 10)
 
     st.header("Perf")
     max_samples = st.slider("Max matchs traités par joueur (CPU)", 5, 40, 20)
@@ -911,14 +902,6 @@ def fmt(v: Optional[float], digits: int = 0) -> str:
 
 
 def mean_safe(values):
-    clean = [
-        v for v in values
-        if v is not None and not (isinstance(v, float) and np.isnan(v))
-    ]
-    return float(np.mean(clean)) if clean else None
-
-
-def mean_safe(values):
     """
     Moyenne robuste :
     - ignore None
@@ -934,22 +917,6 @@ def mean_safe(values):
     return float(np.mean(clean))
 
 
-def series_for_player_in_match(client: RiotClient, match_id: str, puuid: str) -> Optional[pd.DataFrame]:
-    try:
-        match = client.get_match(match_id)
-        tl = client.get_timeline(match_id)
-    except Exception:
-        return None
-
-    pid = find_pid_by_puuid(match, puuid)
-    if not pid:
-        return None
-
-    dur_s = match["info"].get("gameDuration", 0) or 0
-    max_min = int(dur_s // 60)
-    return timeline_series_full_minutes(tl, pid, max_min=max_min)
-
-
 if run:
     # minimap
     try:
@@ -959,14 +926,6 @@ if run:
         st.stop()
 
     client = RiotClient()
-
-compare_puuid = None
-if compare_player_text and "#" in compare_player_text:
-    try:
-        cg, ct = compare_player_text.split("#", 1)
-        compare_puuid = client.get_puuid_by_riot_id(cg.strip(), ct.strip())
-    except Exception:
-        compare_puuid = None
 
     # scrim match ids
     scrim_match_ids = parse_match_ids(scrim_match_ids_text) if scrim_mode else None
