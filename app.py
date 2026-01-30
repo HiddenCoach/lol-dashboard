@@ -27,7 +27,6 @@ if "analysis_ready" not in st.session_state:
 if "analysis_payload" not in st.session_state:
     st.session_state.analysis_payload = {}
 
-
 def set_analysis_payload(payload: dict):
     st.session_state.analysis_payload = payload
     st.session_state.analysis_ready = True
@@ -43,6 +42,7 @@ QUEUE_MAP = {
     "SoloQ (420)": 420,
     "Flex (440)": 440,
 }
+
 
 # =========================
 # Map bounds (Summoner's Rift map11)
@@ -62,6 +62,7 @@ def norm_xy(x: float, y: float) -> Tuple[float, float]:
 
 
 def norm_to_px(nx: float, ny: float, w: int, h: int) -> Tuple[float, float]:
+    # Image origin: top-left. Timeline coords increase y upward -> invert for display.
     px = nx * w
     py = (1.0 - ny) * h
     return px, py
@@ -89,10 +90,12 @@ class RiotClient:
             return r.json()
         raise RuntimeError("Rate limit (429) persistant. Baisse le nombre de matchs/joueurs.")
 
+    # account-v1 (regional): Riot ID -> puuid
     def get_puuid_by_riot_id(self, game_name: str, tag_line: str) -> str:
         url = f"https://{EUW_REGIONAL}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
         return self._get(url)["puuid"]
 
+    # match-v5 (regional)
     def get_match_ids_by_puuid(self, puuid: str, count: int = 20, queue: Optional[int] = None) -> List[str]:
         url = f"https://{EUW_REGIONAL}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids"
         params: Dict[str, Any] = {"count": count}
@@ -122,7 +125,7 @@ def cached_puuid(game: str, tag: str) -> Optional[str]:
 
 
 # =========================
-# Data Dragon minimap / champions
+# Data Dragon minimap + champions
 # =========================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def get_latest_ddragon_version() -> str:
@@ -153,7 +156,7 @@ def fetch_champion_id_to_name() -> Dict[int, str]:
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     data = r.json()["data"]
-    out: Dict[int, str] = {}
+    out = {}
     for _, champ in data.items():
         try:
             cid = int(champ["key"])
@@ -240,7 +243,115 @@ def iter_kill_events(timeline: Dict[str, Any]):
 
 
 # =========================
-# ✅ WARDS: inclut aussi wards "items support"
+# Role-aware zone classification
+# - TOP_SIDE vs BOT_SIDE (map-side), NOT "toplane".
+# - OFFSIDE tagging by role.
+# =========================
+def role_aware_zone(x: float, y: float, role: str) -> str:
+    nx, ny = norm_xy(x, y)
+    d_diag = abs(nx - ny)
+    center_dist = ((nx - 0.5) ** 2 + (ny - 0.5) ** 2) ** 0.5
+
+    if d_diag < 0.05 and center_dist < 0.30:
+        base = "MID"
+    elif d_diag < 0.07:
+        base = "RIVER"
+    else:
+        base = "TOP_SIDE" if ny > nx else "BOT_SIDE"
+
+    top_lane_corridor = (nx < 0.38 and ny > 0.62)
+    bot_lane_corridor = (nx > 0.62 and ny < 0.38)
+    if base == "TOP_SIDE" and top_lane_corridor:
+        base = "TOP_LANE_AREA"
+    if base == "BOT_SIDE" and bot_lane_corridor:
+        base = "BOT_LANE_AREA"
+
+    role = (role or "UNKNOWN").upper()
+
+    if role in {"BOTTOM", "UTILITY"}:
+        if base in {"TOP_SIDE", "TOP_LANE_AREA"}:
+            return "OFFSIDE_TOP"
+        return base
+    if role == "TOP":
+        if base in {"BOT_SIDE", "BOT_LANE_AREA"}:
+            return "OFFSIDE_BOT"
+        return base
+
+    return base
+
+
+# =========================
+# Deaths / Kills extraction
+# =========================
+def extract_deaths_window(
+    timeline: Dict[str, Any],
+    victim_pid: int,
+    start_min: float,
+    end_min: float,
+    match_id: str,
+    side: str,
+    role: str,
+) -> pd.DataFrame:
+    out = []
+    for ts, ev in iter_kill_events(timeline):
+        if ev.get("victimId") != victim_pid:
+            continue
+        pos = ev.get("position")
+        if not pos:
+            continue
+        t_min = ts / 60000.0
+        if t_min < start_min or t_min > end_min:
+            continue
+        x = float(pos["x"])
+        y = float(pos["y"])
+        out.append({
+            "matchId": match_id,
+            "minute": float(t_min),
+            "x": x,
+            "y": y,
+            "side": side,      # per match => blue/red points correct even when mixed
+            "role": role,
+            "zone": role_aware_zone(x, y, role),
+        })
+    return pd.DataFrame(out)
+
+
+def extract_kills_window(
+    timeline: Dict[str, Any],
+    killer_pid: int,
+    start_min: float,
+    end_min: float,
+    match_id: str,
+    side: str,
+    role: str,
+) -> pd.DataFrame:
+    out = []
+    for ts, ev in iter_kill_events(timeline):
+        if ev.get("killerId") != killer_pid:
+            continue
+        pos = ev.get("position")
+        if not pos:
+            continue
+        t_min = ts / 60000.0
+        if t_min < start_min or t_min > end_min:
+            continue
+        x = float(pos["x"])
+        y = float(pos["y"])
+        out.append({
+            "matchId": match_id,
+            "minute": float(t_min),
+            "x": x,
+            "y": y,
+            "side": side,
+            "role": role,
+            "zone": role_aware_zone(x, y, role),
+        })
+    return pd.DataFrame(out)
+
+
+# =========================
+# Wards (vision) extraction
+# - inclut wards items support en VERT (comme trinket)
 # =========================
 WARD_COLOR = {
     "CONTROL_WARD": "#E53935",   # rouge
@@ -249,7 +360,6 @@ WARD_COLOR = {
     "UNKNOWN": "#B0BEC5",
 }
 
-
 def iter_ward_events(timeline: Dict[str, Any]):
     for fr in timeline["info"]["frames"]:
         ts = fr.get("timestamp", 0)
@@ -257,17 +367,19 @@ def iter_ward_events(timeline: Dict[str, Any]):
             if ev.get("type") == "WARD_PLACED":
                 yield ts, ev
 
-
 def ward_bucket(ward_type: Optional[str]) -> str:
     wt = (ward_type or "").strip().upper()
 
+    # PINK / CONTROL
     if "CONTROL" in wt or "PINK" in wt:
         return "CONTROL_WARD"
 
+    # BLUE TRINKET
     if "BLUE_TRINKET" in wt or "FARSIGHT" in wt:
         return "BLUE_TRINKET"
 
-    # trinket + support item wards + sight wards
+    # GREEN: TRINKET + SUPPORT ITEM wards
+    # (Riot n'est pas toujours consistant => on regroupe les wards "item" ici)
     if (
         "TRINKET" in wt
         or "YELLOW" in wt
@@ -280,7 +392,6 @@ def ward_bucket(ward_type: Optional[str]) -> str:
         return "TRINKET"
 
     return "UNKNOWN"
-
 
 def extract_wards_window(
     timeline: Dict[str, Any],
@@ -306,234 +417,25 @@ def extract_wards_window(
         y = float(pos.get("y", 0.0))
         wt = ev.get("wardType")
 
-        out.append(
-            {
-                "matchId": match_id,
-                "minute": float(t_min),
-                "x": x,
-                "y": y,
-                "side": side,
-                "role": role,
-                "wardType": wt or "—",
-                "bucket": ward_bucket(wt),
-            }
-        )
+        out.append({
+            "matchId": match_id,
+            "minute": float(t_min),
+            "x": x,
+            "y": y,
+            "side": side,
+            "role": role,
+            "wardType": wt or "—",
+            "bucket": ward_bucket(wt),
+        })
     return pd.DataFrame(out)
-
-
-def minimap_wards_plotly(
-    minimap: Image.Image,
-    df: pd.DataFrame,
-    title: str,
-    point_size: int,
-    point_alpha: float,
-) -> Optional[go.Figure]:
-    if df is None or df.empty:
-        return None
-
-    w, h = minimap.size
-    b64 = minimap_to_base64_png(minimap)
-
-    nxy = np.array([norm_xy(x, y) for x, y in zip(df["x"].values, df["y"].values)])
-    px_py = np.array([norm_to_px(nx, ny, w, h) for nx, ny in nxy])
-
-    d = df.copy()
-    d["px"] = px_py[:, 0]
-    d["py"] = px_py[:, 1]
-
-    fig = go.Figure()
-    fig.add_layout_image(
-        dict(
-            source=f"data:image/png;base64,{b64}",
-            xref="x",
-            yref="y",
-            x=0,
-            y=0,
-            sizex=w,
-            sizey=h,
-            sizing="stretch",
-            layer="below",
-        )
-    )
-
-    for bucket in ["CONTROL_WARD", "TRINKET", "BLUE_TRINKET", "UNKNOWN"]:
-        ds = d[d["bucket"] == bucket]
-        if ds.empty:
-            continue
-        fig.add_trace(
-            go.Scattergl(
-                x=ds["px"],
-                y=ds["py"],
-                mode="markers",
-                name=bucket,
-                marker=dict(
-                    size=point_size,
-                    color=WARD_COLOR.get(bucket, "#B0BEC5"),
-                    opacity=point_alpha,
-                    line=dict(width=0.9, color="white"),
-                ),
-                hovertemplate=(
-                    "min=%{customdata[0]}<br>"
-                    "ward=%{customdata[1]}<br>"
-                    "bucket=%{customdata[2]}<br>"
-                    "side=%{customdata[3]}<br>"
-                    "match=%{customdata[4]}<extra></extra>"
-                ),
-                customdata=np.stack(
-                    [
-                        np.floor(ds["minute"].values).astype(int),
-                        ds["wardType"].values,
-                        ds["bucket"].values,
-                        ds["side"].values,
-                        ds["matchId"].values,
-                    ],
-                    axis=1,
-                ),
-            )
-        )
-
-    fig.update_xaxes(range=[0, w], showgrid=False, visible=False)
-    fig.update_yaxes(range=[h, 0], showgrid=False, visible=False, scaleanchor="x", scaleratio=1)
-    fig.update_layout(
-        title=title,
-        margin=dict(l=0, r=0, t=55, b=0),
-        height=520,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01),
-    )
-    return fig
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 20)
-def cached_wards_for_player_in_match(match_id: str, puuid: str) -> Optional[Dict[str, pd.DataFrame]]:
-    try:
-        client = RiotClient()
-        match = client.get_match(match_id)
-        tl = client.get_timeline(match_id)
-    except Exception:
-        return None
-
-    pid = find_pid_by_puuid(match, puuid)
-    if not pid:
-        return None
-
-    meta = participant_meta(match, puuid)
-    side = meta["side"]
-    role = meta["teamPosition"]
-
-    return {
-        "0_5": extract_wards_window(tl, pid, 0.0, 5.0, match_id, side, role),
-        "5_10": extract_wards_window(tl, pid, 5.0, 10.0, match_id, side, role),
-        "10_15": extract_wards_window(tl, pid, 10.0, 15.0, match_id, side, role),
-        "15_30": extract_wards_window(tl, pid, 15.0, 30.0, match_id, side, role),
-    }
 
 
 # =========================
-# Role-aware zones
+# Timeline snapshots & minute series
 # =========================
-def role_aware_zone(x: float, y: float, role: str) -> str:
-    nx, ny = norm_xy(x, y)
-    d_diag = abs(nx - ny)
-    center_dist = ((nx - 0.5) ** 2 + (ny - 0.5) ** 2) ** 0.5
-
-    if d_diag < 0.05 and center_dist < 0.30:
-        base = "MID"
-    elif d_diag < 0.07:
-        base = "RIVER"
-    else:
-        base = "TOP_SIDE" if ny > nx else "BOT_SIDE"
-
-    top_lane_corridor = (nx < 0.38 and ny > 0.62)
-    bot_lane_corridor = (nx > 0.62 and ny < 0.38)
-    if base == "TOP_SIDE" and top_lane_corridor:
-        base = "TOP_LANE_AREA"
-    if base == "BOT_SIDE" and bot_lane_corridor:
-        base = "BOT_LANE_AREA"
-
-    role = (role or "UNKNOWN").upper()
-    if role in {"BOTTOM", "UTILITY"}:
-        if base in {"TOP_SIDE", "TOP_LANE_AREA"}:
-            return "OFFSIDE_TOP"
-        return base
-    if role == "TOP":
-        if base in {"BOT_SIDE", "BOT_LANE_AREA"}:
-            return "OFFSIDE_BOT"
-        return base
-
-    return base
-
-
-def extract_deaths_window(
-    timeline: Dict[str, Any],
-    victim_pid: int,
-    start_min: float,
-    end_min: float,
-    match_id: str,
-    side: str,
-    role: str,
-) -> pd.DataFrame:
-    out = []
-    for ts, ev in iter_kill_events(timeline):
-        if ev.get("victimId") != victim_pid:
-            continue
-        pos = ev.get("position")
-        if not pos:
-            continue
-        t_min = ts / 60000.0
-        if t_min < start_min or t_min > end_min:
-            continue
-        x = float(pos["x"])
-        y = float(pos["y"])
-        out.append(
-            {
-                "matchId": match_id,
-                "minute": float(t_min),
-                "x": x,
-                "y": y,
-                "side": side,
-                "role": role,
-                "zone": role_aware_zone(x, y, role),
-            }
-        )
-    return pd.DataFrame(out)
-
-
-def extract_kills_window(
-    timeline: Dict[str, Any],
-    killer_pid: int,
-    start_min: float,
-    end_min: float,
-    match_id: str,
-    side: str,
-    role: str,
-) -> pd.DataFrame:
-    out = []
-    for ts, ev in iter_kill_events(timeline):
-        if ev.get("killerId") != killer_pid:
-            continue
-        pos = ev.get("position")
-        if not pos:
-            continue
-        t_min = ts / 60000.0
-        if t_min < start_min or t_min > end_min:
-            continue
-        x = float(pos["x"])
-        y = float(pos["y"])
-        out.append(
-            {
-                "matchId": match_id,
-                "minute": float(t_min),
-                "x": x,
-                "y": y,
-                "side": side,
-                "role": role,
-                "zone": role_aware_zone(x, y, role),
-            }
-        )
-    return pd.DataFrame(out)
-
-
-def get_snapshots_from_timeline(timeline: Dict[str, Any], pid: int, minutes=(5, 10, 15)) -> Dict[int, Dict[str, Optional[float]]]:
+def get_snapshots_from_timeline(
+    timeline: Dict[str, Any], pid: int, minutes=(5, 10, 15)
+) -> Dict[int, Dict[str, Optional[float]]]:
     frames = timeline["info"]["frames"]
     out = {m: {"gold": None, "xp": None} for m in minutes}
     for idx, fr in enumerate(frames):
@@ -548,11 +450,18 @@ def get_snapshots_from_timeline(timeline: Dict[str, Any], pid: int, minutes=(5, 
         xp = pf.get("xp")
         for m in minutes:
             if t_min <= m:
-                out[m] = {"gold": float(gold) if gold is not None else None, "xp": float(xp) if xp is not None else None}
+                out[m] = {
+                    "gold": float(gold) if gold is not None else None,
+                    "xp": float(xp) if xp is not None else None,
+                }
     return out
 
 
 def timeline_series_full_minutes(timeline: Dict[str, Any], pid: int, max_min: int) -> pd.DataFrame:
+    """
+    FULL match series, minute by minute INTEGERS only (0..max_min)
+    Includes: gold, xp, damage, cs_total, cs_per_min_avg, cs_in_min
+    """
     frames = timeline["info"]["frames"]
     minute_rows = {}
 
@@ -630,16 +539,14 @@ def objectives_0_15(timeline: Dict[str, Any]) -> pd.DataFrame:
         for ev in fr.get("events", []):
             t = ev.get("type")
             if t in {"ELITE_MONSTER_KILL", "DRAGON_KILL", "RIFT_HERALD_KILL", "TURRET_PLATE_DESTROYED", "BUILDING_KILL"}:
-                rows.append(
-                    {
-                        "minute": int(ts // 60000),
-                        "type": t,
-                        "teamId": ev.get("teamId"),
-                        "monsterType": ev.get("monsterType") or ev.get("monsterSubType"),
-                        "laneType": ev.get("laneType"),
-                        "towerType": ev.get("towerType"),
-                    }
-                )
+                rows.append({
+                    "minute": int(ts // 60000),
+                    "type": t,
+                    "teamId": ev.get("teamId"),
+                    "monsterType": ev.get("monsterType") or ev.get("monsterSubType"),
+                    "laneType": ev.get("laneType"),
+                    "towerType": ev.get("towerType"),
+                })
     df = pd.DataFrame(rows)
     if not df.empty:
         df["side"] = df["teamId"].apply(lambda tid: "BLUE" if tid == 100 else ("RED" if tid == 200 else "—"))
@@ -647,12 +554,17 @@ def objectives_0_15(timeline: Dict[str, Any]) -> pd.DataFrame:
 
 
 # =========================
-# Plotting (kills/deaths minimap)
+# Plotting
 # =========================
 SIDE_COLOR = {"BLUE": "#1E88E5", "RED": "#E53935", "UNKNOWN": "#B0BEC5"}
 
-
-def minimap_points_plotly(minimap: Image.Image, df: pd.DataFrame, title: str, point_size: int, point_alpha: float) -> Optional[go.Figure]:
+def minimap_points_plotly(
+    minimap: Image.Image,
+    df: pd.DataFrame,
+    title: str,
+    point_size: int,
+    point_alpha: float,
+) -> Optional[go.Figure]:
     if df is None or df.empty:
         return None
 
@@ -670,12 +582,9 @@ def minimap_points_plotly(minimap: Image.Image, df: pd.DataFrame, title: str, po
     fig.add_layout_image(
         dict(
             source=f"data:image/png;base64,{b64}",
-            xref="x",
-            yref="y",
-            x=0,
-            y=0,
-            sizex=w,
-            sizey=h,
+            xref="x", yref="y",
+            x=0, y=0,
+            sizex=w, sizey=h,
             sizing="stretch",
             layer="below",
         )
@@ -691,7 +600,12 @@ def minimap_points_plotly(minimap: Image.Image, df: pd.DataFrame, title: str, po
                 y=ds["py"],
                 mode="markers",
                 name=side,
-                marker=dict(size=point_size, color=SIDE_COLOR.get(side, "#B0BEC5"), opacity=point_alpha, line=dict(width=1.1, color="white")),
+                marker=dict(
+                    size=point_size,
+                    color=SIDE_COLOR.get(side, "#B0BEC5"),
+                    opacity=point_alpha,
+                    line=dict(width=1.1, color="white"),
+                ),
                 hovertemplate=(
                     "min=%{customdata[0]}<br>"
                     "zone=%{customdata[1]}<br>"
@@ -699,16 +613,13 @@ def minimap_points_plotly(minimap: Image.Image, df: pd.DataFrame, title: str, po
                     "side=%{customdata[3]}<br>"
                     "match=%{customdata[4]}<extra></extra>"
                 ),
-                customdata=np.stack(
-                    [
-                        np.floor(ds["minute"].values).astype(int),
-                        ds["zone"].values,
-                        ds["role"].values,
-                        ds["side"].values,
-                        ds["matchId"].values,
-                    ],
-                    axis=1,
-                ),
+                customdata=np.stack([
+                    np.floor(ds["minute"].values).astype(int),
+                    ds["zone"].values,
+                    ds["role"].values,
+                    ds["side"].values,
+                    ds["matchId"].values
+                ], axis=1),
             )
         )
 
@@ -723,7 +634,12 @@ def minimap_points_plotly(minimap: Image.Image, df: pd.DataFrame, title: str, po
     return fig
 
 
-def minimap_heatmap_matplotlib(minimap: Image.Image, df: pd.DataFrame, title: str, gridsize: int = 48) -> Optional[plt.Figure]:
+def minimap_heatmap_matplotlib(
+    minimap: Image.Image,
+    df: pd.DataFrame,
+    title: str,
+    gridsize: int = 48,
+) -> Optional[plt.Figure]:
     if df is None or df.empty:
         return None
 
@@ -741,6 +657,85 @@ def minimap_heatmap_matplotlib(minimap: Image.Image, df: pd.DataFrame, title: st
     ax.set_ylabel("Y (pixels minimap)")
     ax.set_xlim(0, w)
     ax.set_ylim(h, 0)
+    return fig
+
+
+def minimap_wards_plotly(
+    minimap: Image.Image,
+    df: pd.DataFrame,
+    title: str,
+    point_size: int,
+    point_alpha: float,
+) -> Optional[go.Figure]:
+    if df is None or df.empty:
+        return None
+
+    w, h = minimap.size
+    b64 = minimap_to_base64_png(minimap)
+
+    nxy = np.array([norm_xy(x, y) for x, y in zip(df["x"].values, df["y"].values)])
+    px_py = np.array([norm_to_px(nx, ny, w, h) for nx, ny in nxy])
+
+    d = df.copy()
+    d["px"] = px_py[:, 0]
+    d["py"] = px_py[:, 1]
+
+    fig = go.Figure()
+    fig.add_layout_image(
+        dict(
+            source=f"data:image/png;base64,{b64}",
+            xref="x", yref="y",
+            x=0, y=0,
+            sizex=w, sizey=h,
+            sizing="stretch",
+            layer="below",
+        )
+    )
+
+    for bucket in ["CONTROL_WARD", "TRINKET", "BLUE_TRINKET", "UNKNOWN"]:
+        ds = d[d["bucket"] == bucket]
+        if ds.empty:
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=ds["px"],
+                y=ds["py"],
+                mode="markers",
+                name=bucket,
+                marker=dict(
+                    size=point_size,
+                    color=WARD_COLOR.get(bucket, "#B0BEC5"),
+                    opacity=point_alpha,
+                    line=dict(width=0.9, color="white"),
+                ),
+                hovertemplate=(
+                    "min=%{customdata[0]}<br>"
+                    "ward=%{customdata[1]}<br>"
+                    "bucket=%{customdata[2]}<br>"
+                    "side=%{customdata[3]}<br>"
+                    "match=%{customdata[4]}<extra></extra>"
+                ),
+                customdata=np.stack(
+                    [
+                        np.floor(ds["minute"].values).astype(int),
+                        ds["wardType"].values,
+                        ds["bucket"].values,
+                        ds["side"].values,
+                        ds["matchId"].values,
+                    ],
+                    axis=1,
+                ),
+            )
+        )
+
+    fig.update_xaxes(range=[0, w], showgrid=False, visible=False)
+    fig.update_yaxes(range=[h, 0], showgrid=False, visible=False, scaleanchor="x", scaleratio=1)
+    fig.update_layout(
+        title=title,
+        margin=dict(l=0, r=0, t=55, b=0),
+        height=520,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01),
+    )
     return fig
 
 
@@ -768,7 +763,6 @@ def fmt(v: Optional[float], digits: int = 0) -> str:
 # Series schema + compare plotting
 # =========================
 REQUIRED_SERIES_COLS = ["minute", "gold", "xp", "damage", "cs_total", "cs_per_min_avg", "cs_in_min"]
-
 
 def ensure_series_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -820,8 +814,33 @@ def cached_series_for_player_in_match(match_id: str, puuid: str) -> Optional[pd.
     return timeline_series_full_minutes(tl, pid, max_min=max_min)
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 20)
+def cached_wards_for_player_in_match(match_id: str, puuid: str) -> Optional[Dict[str, pd.DataFrame]]:
+    try:
+        client = RiotClient()
+        match = client.get_match(match_id)
+        tl = client.get_timeline(match_id)
+    except Exception:
+        return None
+
+    pid = find_pid_by_puuid(match, puuid)
+    if not pid:
+        return None
+
+    meta = participant_meta(match, puuid)
+    side = meta["side"]
+    role = meta["teamPosition"]
+
+    return {
+        "0_5": extract_wards_window(tl, pid, 0.0, 5.0, match_id, side, role),
+        "5_10": extract_wards_window(tl, pid, 5.0, 10.0, match_id, side, role),
+        "10_15": extract_wards_window(tl, pid, 10.0, 15.0, match_id, side, role),
+        "15_30": extract_wards_window(tl, pid, 15.0, 30.0, match_id, side, role),
+    }
+
+
 # =========================
-# Draft / Match detail panel
+# Draft / Compo / Match detail panel
 # =========================
 def _safe_dt_from_ms(ms: Optional[int]) -> str:
     if not ms:
@@ -847,19 +866,17 @@ def build_team_table(match: Dict[str, Any], team_id: int) -> pd.DataFrame:
         d = p.get("deaths") or 0
         a = p.get("assists") or 0
 
-        rows.append(
-            {
-                "Rôle": p.get("teamPosition") or "UNKNOWN",
-                "Joueur": riot_full,
-                "Champion": p.get("championName") or "UNKNOWN",
-                "K/D/A": f"{k}/{d}/{a}",
-                "CS": int(cs),
-                "Gold": int(p.get("goldEarned") or 0),
-                "Dmg champs": int(p.get("totalDamageDealtToChampions") or 0),
-                "Vision": int(p.get("visionScore") or 0),
-                "Lvl": int(p.get("champLevel") or 0),
-            }
-        )
+        rows.append({
+            "Rôle": p.get("teamPosition") or "UNKNOWN",
+            "Joueur": riot_full,
+            "Champion": p.get("championName") or "UNKNOWN",
+            "K/D/A": f"{k}/{d}/{a}",
+            "CS": int(cs),
+            "Gold": int(p.get("goldEarned") or 0),
+            "Dmg champs": int(p.get("totalDamageDealtToChampions") or 0),
+            "Vision": int(p.get("visionScore") or 0),
+            "Lvl": int(p.get("champLevel") or 0),
+        })
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -905,7 +922,10 @@ def render_match_draft_panel(match: Dict[str, Any], focus_puuid: Optional[str] =
             cid = b.get("championId")
             if cid is None:
                 continue
-            names.append(champ_map.get(int(cid), f"champId:{cid}"))
+            try:
+                names.append(champ_map.get(int(cid), f"champId:{cid}"))
+            except Exception:
+                names.append(f"champId:{cid}")
         return ", ".join(names) if names else "—"
 
     blue_team = next((t for t in teams if t.get("teamId") == 100), {})
@@ -1138,6 +1158,135 @@ def build_player_pdf(
 
 
 # =========================
+# Data fetchers (bundles)
+# =========================
+@st.cache_data(show_spinner=False, ttl=60 * 20)
+def fetch_player_bundle_by_match_list(riot_id_full: str, game: str, tag: str, match_ids: List[str]):
+    client = RiotClient()
+    puuid = client.get_puuid_by_riot_id(game, tag)
+
+    bundles = []
+    for mid in match_ids:
+        match = client.get_match(mid)
+        tl = client.get_timeline(mid)
+
+        pid = find_pid_by_puuid(match, puuid)
+        if not pid:
+            continue
+
+        meta = participant_meta(match, puuid)
+        champ = meta["championName"]
+        role = meta["teamPosition"]
+        side = meta["side"]
+
+        # deaths windows
+        d_0_5 = extract_deaths_window(tl, pid, 0.0, 5.0, mid, side, role)
+        d_5_10 = extract_deaths_window(tl, pid, 5.0, 10.0, mid, side, role)
+        d_10_15 = extract_deaths_window(tl, pid, 10.0, 15.0, mid, side, role)
+        d_0_15 = extract_deaths_window(tl, pid, 0.0, 15.0, mid, side, role)
+        d_15_30 = extract_deaths_window(tl, pid, 15.0, 30.0, mid, side, role)
+
+        # kills
+        k_all = extract_kills_window(tl, pid, 0.0, 90.0, mid, side, role)
+
+        # wards windows
+        w_0_5 = extract_wards_window(tl, pid, 0.0, 5.0, mid, side, role)
+        w_5_10 = extract_wards_window(tl, pid, 5.0, 10.0, mid, side, role)
+        w_10_15 = extract_wards_window(tl, pid, 10.0, 15.0, mid, side, role)
+        w_15_30 = extract_wards_window(tl, pid, 15.0, 30.0, mid, side, role)
+
+        # duration minutes
+        dur_s = match["info"].get("gameDuration", 0) or 0
+        max_min = int(dur_s // 60)
+        series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
+
+        bundles.append({
+            "matchId": mid,
+            "puuid": puuid,
+            "champion": champ,
+            "role": role,
+            "side": side,
+            "win": meta["win"],
+            "d_0_5": d_0_5,
+            "d_5_10": d_5_10,
+            "d_10_15": d_10_15,
+            "d_0_15": d_0_15,
+            "d_15_30": d_15_30,
+            "kills_all": k_all,
+            "w_0_5": w_0_5,
+            "w_5_10": w_5_10,
+            "w_10_15": w_10_15,
+            "w_15_30": w_15_30,
+            "series_full": series_full,
+            "match": match,
+            "timeline": tl,
+            "max_min": max_min,
+        })
+    return bundles
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 20)
+def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: int, queue_val: Optional[int]):
+    client = RiotClient()
+    puuid = client.get_puuid_by_riot_id(game, tag)
+    match_ids = client.get_match_ids_by_puuid(puuid, count=count, queue=queue_val)
+
+    bundles = []
+    for mid in match_ids:
+        match = client.get_match(mid)
+        tl = client.get_timeline(mid)
+
+        pid = participant_id_for_puuid(match, puuid)
+        meta = participant_meta(match, puuid)
+
+        champ = meta["championName"]
+        role = meta["teamPosition"]
+        side = meta["side"]
+
+        d_0_5 = extract_deaths_window(tl, pid, 0.0, 5.0, mid, side, role)
+        d_5_10 = extract_deaths_window(tl, pid, 5.0, 10.0, mid, side, role)
+        d_10_15 = extract_deaths_window(tl, pid, 10.0, 15.0, mid, side, role)
+        d_0_15 = extract_deaths_window(tl, pid, 0.0, 15.0, mid, side, role)
+        d_15_30 = extract_deaths_window(tl, pid, 15.0, 30.0, mid, side, role)
+
+        k_all = extract_kills_window(tl, pid, 0.0, 90.0, mid, side, role)
+
+        # wards windows
+        w_0_5 = extract_wards_window(tl, pid, 0.0, 5.0, mid, side, role)
+        w_5_10 = extract_wards_window(tl, pid, 5.0, 10.0, mid, side, role)
+        w_10_15 = extract_wards_window(tl, pid, 10.0, 15.0, mid, side, role)
+        w_15_30 = extract_wards_window(tl, pid, 15.0, 30.0, mid, side, role)
+
+        dur_s = match["info"].get("gameDuration", 0) or 0
+        max_min = int(dur_s // 60)
+        series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
+
+        bundles.append({
+            "matchId": mid,
+            "puuid": puuid,
+            "champion": champ,
+            "role": role,
+            "side": side,
+            "win": meta["win"],
+            "d_0_5": d_0_5,
+            "d_5_10": d_5_10,
+            "d_10_15": d_10_15,
+            "d_0_15": d_0_15,
+            "d_15_30": d_15_30,
+            "kills_all": k_all,
+            "w_0_5": w_0_5,
+            "w_5_10": w_5_10,
+            "w_10_15": w_10_15,
+            "w_15_30": w_15_30,
+            "series_full": series_full,
+            "match": match,
+            "timeline": tl,
+            "max_min": max_min,
+        })
+    return bundles
+
+
+# =========================
 # UI
 # =========================
 st.set_page_config(page_title="EUW Coach Dashboard", layout="wide")
@@ -1158,10 +1307,8 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 )
 
 st.title("Heatmap et Data, par Hidden Analyst Coach NT")
-st.caption(
-    "Minimap interactive, heatmaps deaths/kills, laning, macro, warding (vision), Team A vs Team B, scrim custom, "
-    "comparaison optionnelle, match précis + draft/compo"
-)
+st.caption("EUW only • deaths/kills/wards minimap • laning + macro • match précis + draft • comparaison (joueur + pro wards) • team A vs B • scrim custom")
+
 
 with st.sidebar:
     st.header("Mode")
@@ -1195,8 +1342,12 @@ with st.sidebar:
     exact_opponent_text = st.text_input("Adversaire exact Riot ID (GameName#TAG)")
 
     st.header("Comparaison joueur (optionnel)")
-    compare_player_text = st.text_input("Comparer avec Riot ID (GameName#TAG)", value="")
-    compare_mode = st.radio("Mode comparaison", ["Même matchs (si présent)", "Ses matchs récents"], index=0)
+    compare_player_text = st.text_input("Comparer courbes avec Riot ID (GameName#TAG)", value="")
+    compare_mode = st.radio(
+        "Mode comparaison (courbes)",
+        ["Même matchs (si présent)", "Ses matchs récents"],
+        index=0,
+    )
     compare_match_count = st.slider("Nb matchs (joueur comparé)", 1, 30, 10)
 
     st.header("Team A vs Team B (optionnel)")
@@ -1214,11 +1365,12 @@ with st.sidebar:
         st.session_state.analysis_ready = False
         st.session_state.analysis_payload = {}
         for k in list(st.session_state.keys()):
-            if str(k).startswith("scope_"):
+            if str(k).startswith("scope_") or str(k).startswith("ward_") or str(k).startswith("pro_"):
                 del st.session_state[k]
         st.rerun()
 
     run = st.button("Analyser (EUW)")
+
     if st.session_state.analysis_ready:
         st.caption("✅ Analyse chargée : tu peux changer match précis / filtres sans re-cliquer Analyser.")
 
@@ -1231,133 +1383,6 @@ def pass_filters(bundle) -> bool:
     if filter_champ.strip() and bundle["champion"] != filter_champ.strip():
         return False
     return True
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 20)
-def fetch_player_bundle_by_match_list(riot_id_full: str, game: str, tag: str, match_ids: List[str]):
-    client = RiotClient()
-    puuid = client.get_puuid_by_riot_id(game, tag)
-
-    bundles = []
-    for mid in match_ids:
-        match = client.get_match(mid)
-        tl = client.get_timeline(mid)
-
-        pid = find_pid_by_puuid(match, puuid)
-        if not pid:
-            continue
-
-        meta = participant_meta(match, puuid)
-        champ = meta["championName"]
-        role = meta["teamPosition"]
-        side = meta["side"]
-
-        d_0_5 = extract_deaths_window(tl, pid, 0.0, 5.0, mid, side, role)
-        d_5_10 = extract_deaths_window(tl, pid, 5.0, 10.0, mid, side, role)
-        d_10_15 = extract_deaths_window(tl, pid, 10.0, 15.0, mid, side, role)
-        d_0_15 = extract_deaths_window(tl, pid, 0.0, 15.0, mid, side, role)
-        d_15_30 = extract_deaths_window(tl, pid, 15.0, 30.0, mid, side, role)
-
-        k_all = extract_kills_window(tl, pid, 0.0, 90.0, mid, side, role)
-
-        # ✅ wards windows
-        w_0_5 = extract_wards_window(tl, pid, 0.0, 5.0, mid, side, role)
-        w_5_10 = extract_wards_window(tl, pid, 5.0, 10.0, mid, side, role)
-        w_10_15 = extract_wards_window(tl, pid, 10.0, 15.0, mid, side, role)
-        w_15_30 = extract_wards_window(tl, pid, 15.0, 30.0, mid, side, role)
-
-        dur_s = match["info"].get("gameDuration", 0) or 0
-        max_min = int(dur_s // 60)
-        series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
-
-        bundles.append(
-            {
-                "matchId": mid,
-                "puuid": puuid,
-                "champion": champ,
-                "role": role,
-                "side": side,
-                "win": meta["win"],
-                "d_0_5": d_0_5,
-                "d_5_10": d_5_10,
-                "d_10_15": d_10_15,
-                "d_0_15": d_0_15,
-                "d_15_30": d_15_30,
-                "kills_all": k_all,
-                "w_0_5": w_0_5,
-                "w_5_10": w_5_10,
-                "w_10_15": w_10_15,
-                "w_15_30": w_15_30,
-                "series_full": series_full,
-                "match": match,
-                "timeline": tl,
-                "max_min": max_min,
-            }
-        )
-    return bundles
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 20)
-def fetch_player_bundle_normal(riot_id_full: str, game: str, tag: str, count: int, queue_val: Optional[int]):
-    client = RiotClient()
-    puuid = client.get_puuid_by_riot_id(game, tag)
-    match_ids = client.get_match_ids_by_puuid(puuid, count=count, queue=queue_val)
-
-    bundles = []
-    for mid in match_ids:
-        match = client.get_match(mid)
-        tl = client.get_timeline(mid)
-
-        pid = participant_id_for_puuid(match, puuid)
-        meta = participant_meta(match, puuid)
-
-        champ = meta["championName"]
-        role = meta["teamPosition"]
-        side = meta["side"]
-
-        d_0_5 = extract_deaths_window(tl, pid, 0.0, 5.0, mid, side, role)
-        d_5_10 = extract_deaths_window(tl, pid, 5.0, 10.0, mid, side, role)
-        d_10_15 = extract_deaths_window(tl, pid, 10.0, 15.0, mid, side, role)
-        d_0_15 = extract_deaths_window(tl, pid, 0.0, 15.0, mid, side, role)
-        d_15_30 = extract_deaths_window(tl, pid, 15.0, 30.0, mid, side, role)
-
-        k_all = extract_kills_window(tl, pid, 0.0, 90.0, mid, side, role)
-
-        # ✅ wards windows
-        w_0_5 = extract_wards_window(tl, pid, 0.0, 5.0, mid, side, role)
-        w_5_10 = extract_wards_window(tl, pid, 5.0, 10.0, mid, side, role)
-        w_10_15 = extract_wards_window(tl, pid, 10.0, 15.0, mid, side, role)
-        w_15_30 = extract_wards_window(tl, pid, 15.0, 30.0, mid, side, role)
-
-        dur_s = match["info"].get("gameDuration", 0) or 0
-        max_min = int(dur_s // 60)
-        series_full = timeline_series_full_minutes(tl, pid, max_min=max_min)
-
-        bundles.append(
-            {
-                "matchId": mid,
-                "puuid": puuid,
-                "champion": champ,
-                "role": role,
-                "side": side,
-                "win": meta["win"],
-                "d_0_5": d_0_5,
-                "d_5_10": d_5_10,
-                "d_10_15": d_10_15,
-                "d_0_15": d_0_15,
-                "d_15_30": d_15_30,
-                "kills_all": k_all,
-                "w_0_5": w_0_5,
-                "w_5_10": w_5_10,
-                "w_10_15": w_10_15,
-                "w_15_30": w_15_30,
-                "series_full": series_full,
-                "match": match,
-                "timeline": tl,
-                "max_min": max_min,
-            }
-        )
-    return bundles
 
 
 # =========================
@@ -1429,9 +1454,11 @@ if should_render and st.session_state.analysis_ready:
     bundles_by_player = payload["bundles_by_player"]
     team_vs = payload.get("team_vs")
     analysis_settings = payload.get("analysis_settings", {})
+    queue_val_live = analysis_settings.get("queue_val", None)
 
     client_live = RiotClient()
 
+    # Optional exact opponent
     opponent_puuid = None
     if exact_opponent_text and "#" in exact_opponent_text:
         try:
@@ -1440,6 +1467,7 @@ if should_render and st.session_state.analysis_ready:
         except Exception:
             opponent_puuid = None
 
+    # Optional compare player for curves
     compare_puuid = None
     compare_label = None
     if compare_player_text and "#" in compare_player_text:
@@ -1451,6 +1479,7 @@ if should_render and st.session_state.analysis_ready:
             compare_puuid = None
             compare_label = None
 
+    # Team vs section
     if analysis_settings.get("enable_team_vs", False):
         st.markdown("## 👥 Team A vs Team B (option)")
         if team_vs and team_vs.get("error"):
@@ -1479,6 +1508,7 @@ if should_render and st.session_state.analysis_ready:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
 
+            # Scope selector
             st.markdown("### 🎯 Scope d'analyse")
             match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
             key_scope = f"scope_{rid_full}"
@@ -1500,7 +1530,7 @@ if should_render and st.session_state.analysis_ready:
 
             st.success(f"Scope actif: **{scope_label}** • matchs dans le scope: **{len(bundles_use)}**")
 
-            # ✅ Détails match (uniquement si match précis)
+            # Match details panel only when single match
             if scope_choice != "Global (tous les matchs)":
                 try:
                     render_match_draft_panel(bundles_use[0]["match"], focus_puuid=bundles_use[0]["puuid"])
@@ -1513,9 +1543,13 @@ if should_render and st.session_state.analysis_ready:
             zone0_list, zoneMid_list = [], []
             obj_rows = []
 
+            # wards agg
+            w0_5_all, w5_10_all, w10_15_all, w15_30_all = [], [], [], []
+
             max_duration_min = max([b["max_min"] for b in bundles_use]) if bundles_use else 0
             series_stack = []
 
+            # laning compare
             matchup_gold_d = {5: [], 10: [], 15: []}
             matchup_xp_d = {5: [], 10: [], 15: []}
             exact_gold_d = {5: [], 10: [], 15: []}
@@ -1525,6 +1559,7 @@ if should_render and st.session_state.analysis_ready:
             deaths0_count, deathsMid_count = [], []
 
             for b in bundles_use:
+                # deaths df windows
                 for src, acc in [
                     (b["d_0_5"], d0_5_all),
                     (b["d_5_10"], d5_10_all),
@@ -1535,9 +1570,21 @@ if should_render and st.session_state.analysis_ready:
                     if src is not None and not src.empty:
                         acc.append(src)
 
+                # kills
                 if b["kills_all"] is not None and not b["kills_all"].empty:
                     kills_all_list.append(b["kills_all"])
 
+                # wards
+                for wsrc, wacc in [
+                    (b.get("w_0_5"), w0_5_all),
+                    (b.get("w_5_10"), w5_10_all),
+                    (b.get("w_10_15"), w10_15_all),
+                    (b.get("w_15_30"), w15_30_all),
+                ]:
+                    if wsrc is not None and not wsrc.empty:
+                        wacc.append(wsrc)
+
+                # counts
                 deaths0_count.append(len(b["d_0_15"]) if b["d_0_15"] is not None else 0)
                 deathsMid_count.append(len(b["d_15_30"]) if b["d_15_30"] is not None else 0)
 
@@ -1548,6 +1595,7 @@ if should_render and st.session_state.analysis_ready:
 
                 obj_rows.append(objectives_0_15(b["timeline"]))
 
+                # series aligned to max_duration_min
                 s = ensure_series_schema(b.get("series_full"))
                 if s.empty:
                     continue
@@ -1566,6 +1614,7 @@ if should_render and st.session_state.analysis_ready:
 
                 series_stack.append(s.copy())
 
+                # laning metrics
                 match = b["match"]
                 tl = b["timeline"]
                 my_pid = participant_id_for_puuid(match, b["puuid"])
@@ -1591,6 +1640,7 @@ if should_render and st.session_state.analysis_ready:
                             if my_snaps[m]["xp"] is not None and ex_snaps[m]["xp"] is not None:
                                 exact_xp_d[m].append(my_snaps[m]["xp"] - ex_snaps[m]["xp"])
 
+                # lobby mean diff @15
                 others_gold, others_xp = [], []
                 for pid in range(1, 11):
                     snaps = get_snapshots_from_timeline(tl, pid, minutes=(15,))
@@ -1605,13 +1655,20 @@ if should_render and st.session_state.analysis_ready:
                 if my_snaps[15]["xp"] is not None and others_xp:
                     lobby_xp_d15.append(my_snaps[15]["xp"] - float(np.mean(others_xp)))
 
-            df_0_5 = pd.concat(d0_5_all, ignore_index=True) if d0_5_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
-            df_5_10 = pd.concat(d5_10_all, ignore_index=True) if d5_10_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
-            df_10_15 = pd.concat(d10_15_all, ignore_index=True) if d10_15_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
-            df_0_15 = pd.concat(d0_15_all, ignore_index=True) if d0_15_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
-            df_15_30 = pd.concat(d15_30_all, ignore_index=True) if d15_30_all else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
-            df_kills = pd.concat(kills_all_list, ignore_index=True) if kills_all_list else pd.DataFrame(columns=["matchId", "minute", "x", "y", "side", "role", "zone"])
+            # concat dfs
+            df_0_5 = pd.concat(d0_5_all, ignore_index=True) if d0_5_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
+            df_5_10 = pd.concat(d5_10_all, ignore_index=True) if d5_10_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
+            df_10_15 = pd.concat(d10_15_all, ignore_index=True) if d10_15_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
+            df_0_15 = pd.concat(d0_15_all, ignore_index=True) if d0_15_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
+            df_15_30 = pd.concat(d15_30_all, ignore_index=True) if d15_30_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
+            df_kills = pd.concat(kills_all_list, ignore_index=True) if kills_all_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","zone"])
 
+            df_w0_5 = pd.concat(w0_5_all, ignore_index=True) if w0_5_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+            df_w5_10 = pd.concat(w5_10_all, ignore_index=True) if w5_10_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+            df_w10_15 = pd.concat(w10_15_all, ignore_index=True) if w10_15_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+            df_w15_30 = pd.concat(w15_30_all, ignore_index=True) if w15_30_all else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+
+            # series mean
             if series_stack:
                 series_all = pd.concat(series_stack, ignore_index=True)
                 series_mean = series_all.groupby("minute", as_index=False).mean(numeric_only=True)
@@ -1621,17 +1678,16 @@ if should_render and st.session_state.analysis_ready:
                     {"minute": [0], "gold": [np.nan], "xp": [np.nan], "damage": [np.nan], "cs_total": [np.nan], "cs_per_min_avg": [np.nan], "cs_in_min": [np.nan]}
                 )
 
+            # compare curves (optional)
             compare_series_mean = None
             if compare_puuid and not series_mean.empty:
                 comp_stack = []
-
                 if compare_mode == "Même matchs (si présent)":
                     for b in bundles_use:
                         s2 = cached_series_for_player_in_match(b["matchId"], compare_puuid)
                         if s2 is None or s2.empty:
                             continue
                         s2 = ensure_series_schema(s2)
-
                         if int(s2["minute"].max()) < int(max_duration_min):
                             last2 = s2.iloc[-1]
                             extra2 = pd.DataFrame({"minute": range(int(s2["minute"].max()) + 1, int(max_duration_min) + 1)})
@@ -1646,16 +1702,14 @@ if should_render and st.session_state.analysis_ready:
                         comp_stack.append(s2)
                 else:
                     try:
-                        mids2 = client_live.get_match_ids_by_puuid(compare_puuid, count=compare_match_count, queue=queue_val)
+                        mids2 = client_live.get_match_ids_by_puuid(compare_puuid, count=compare_match_count, queue=queue_val_live)
                     except Exception:
                         mids2 = []
-
                     for mid2 in mids2:
                         s2 = cached_series_for_player_in_match(mid2, compare_puuid)
                         if s2 is None or s2.empty:
                             continue
                         s2 = ensure_series_schema(s2)
-
                         if int(s2["minute"].max()) < int(max_duration_min):
                             last2 = s2.iloc[-1]
                             extra2 = pd.DataFrame({"minute": range(int(s2["minute"].max()) + 1, int(max_duration_min) + 1)})
@@ -1674,6 +1728,7 @@ if should_render and st.session_state.analysis_ready:
                     compare_series_mean = comp_all.groupby("minute", as_index=False).mean(numeric_only=True)
                     compare_series_mean["minute"] = compare_series_mean["minute"].astype(int)
 
+            # summaries
             champ = bundles_use[0]["champion"]
             role = bundles_use[0]["role"]
 
@@ -1701,7 +1756,10 @@ if should_render and st.session_state.analysis_ready:
             zoneMid_counts = pd.concat(zoneMid_list, ignore_index=True).value_counts() if zoneMid_list else pd.Series(dtype=int)
             obj_df = pd.concat(obj_rows, ignore_index=True) if obj_rows else pd.DataFrame()
 
-            t_overview, t_laning, t_macro, t_kills, t_export = st.tabs(["📍 Overview", "⚔️ Laning", "🧭 Macro", "☠️ Kills Heatmap", "📄 Export"])
+            # tabs
+            t_overview, t_laning, t_macro, t_warding, t_kills, t_export = st.tabs(
+                ["📍 Overview", "⚔️ Laning", "🧭 Macro", "👁️ Warding", "☠️ Kills Heatmap", "📄 Export"]
+            )
 
             with t_overview:
                 c1, c2, c3, c4 = st.columns(4)
@@ -1714,8 +1772,8 @@ if should_render and st.session_state.analysis_ready:
                     f"<div class='card'><b>Profil</b> : {champ} • {role} • Scope: <b>{scope_label}</b></div>",
                     unsafe_allow_html=True,
                 )
-
                 st.divider()
+
                 left, right = st.columns([1.35, 1])
 
                 with left:
@@ -1731,7 +1789,7 @@ if should_render and st.session_state.analysis_ready:
                     if figH:
                         st.pyplot(figH, clear_figure=True)
 
-                    st.markdown("#### Heatmaps Early par tranches")
+                    st.markdown("#### Heatmaps Early par tranches (morts)")
                     h1, h2, h3 = st.columns(3)
                     with h1:
                         f = minimap_heatmap_matplotlib(minimap, df_0_5, "0–5", gridsize=heat_gridsize)
@@ -1752,7 +1810,7 @@ if should_render and st.session_state.analysis_ready:
                         else:
                             st.caption("—")
 
-                    st.markdown("#### Mid game (15–30)")
+                    st.markdown("#### Mid game (15–30) — morts")
                     figPm = minimap_points_plotly(minimap, df_15_30, "Deaths (15–30) — points BLUE/RED", point_size, point_alpha)
                     if figPm:
                         st.plotly_chart(figPm, use_container_width=True)
@@ -1827,6 +1885,176 @@ if should_render and st.session_state.analysis_ready:
                     st.dataframe(obj_df.sort_values("minute").head(250))
                 else:
                     st.caption("Aucun event objectif détecté 0–15 (selon le scope).")
+
+            with t_warding:
+                st.markdown("### 👁️ Warding / Vision — Heatmaps (points colorés)")
+
+                colA, colB, colC = st.columns([1, 1, 1])
+                with colA:
+                    ward_side_filter = st.selectbox(
+                        "Filtrer par side (joueur analysé)",
+                        ["ALL", "BLUE", "RED"],
+                        index=0,
+                        key=f"ward_side_{rid_full}_{scope_label}",
+                    )
+                with colB:
+                    ward_point_size = st.slider(
+                        "Taille points wards",
+                        6, 38, min(point_size, 22),
+                        key=f"ward_ps_{rid_full}_{scope_label}",
+                    )
+                with colC:
+                    ward_alpha = st.slider(
+                        "Opacité points wards",
+                        0.20, 1.00, float(point_alpha),
+                        key=f"ward_pa_{rid_full}_{scope_label}",
+                    )
+
+                def _filter_side(df: pd.DataFrame, side_choice: str) -> pd.DataFrame:
+                    if df is None or df.empty:
+                        return df
+                    if side_choice == "ALL":
+                        return df
+                    return df[df["side"] == side_choice].copy()
+
+                w_p_0_5 = _filter_side(df_w0_5, ward_side_filter)
+                w_p_5_10 = _filter_side(df_w5_10, ward_side_filter)
+                w_p_10_15 = _filter_side(df_w10_15, ward_side_filter)
+                w_p_15_30 = _filter_side(df_w15_30, ward_side_filter)
+
+                st.caption("Couleurs: **Pink/Control = rouge** • **Trinket + wards items support = vert** • **Blue trinket = bleu**")
+
+                g1, g2 = st.columns(2)
+                with g1:
+                    fig = minimap_wards_plotly(minimap, w_p_0_5, "Wards 0–5", ward_point_size, ward_alpha)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("Aucune ward 0–5 (dans ce scope / filtre side).")
+
+                    fig = minimap_wards_plotly(minimap, w_p_10_15, "Wards 10–15", ward_point_size, ward_alpha)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("Aucune ward 10–15 (dans ce scope / filtre side).")
+
+                with g2:
+                    fig = minimap_wards_plotly(minimap, w_p_5_10, "Wards 5–10", ward_point_size, ward_alpha)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("Aucune ward 5–10 (dans ce scope / filtre side).")
+
+                    fig = minimap_wards_plotly(minimap, w_p_15_30, "Wards 15–30", ward_point_size, ward_alpha)
+                    if fig: st.plotly_chart(fig, use_container_width=True)
+                    else: st.info("Aucune ward 15–30 (dans ce scope / filtre side).")
+
+                st.divider()
+                st.markdown("### ⭐ Comparaison joueur pro (optionnel)")
+
+                pro_col1, pro_col2, pro_col3 = st.columns([1.2, 1, 1])
+                with pro_col1:
+                    pro_riot_id = st.text_input(
+                        "Riot ID du pro à comparer (GameName#TAG)",
+                        value="",
+                        key=f"pro_id_{rid_full}_{scope_label}",
+                    )
+                with pro_col2:
+                    pro_mode = st.selectbox(
+                        "Mode pro",
+                        ["Même matchs (si présent)", "Ses matchs récents"],
+                        index=0,
+                        key=f"pro_mode_{rid_full}_{scope_label}",
+                    )
+                with pro_col3:
+                    pro_side_filter = st.selectbox(
+                        "Filtrer side (pro)",
+                        ["ALL", "BLUE", "RED"],
+                        index=0,
+                        key=f"pro_side_{rid_full}_{scope_label}",
+                    )
+
+                pro_count = st.slider(
+                    "Nb matchs (pro) si 'Ses matchs récents'",
+                    1, 25, 8,
+                    key=f"pro_cnt_{rid_full}_{scope_label}",
+                )
+
+                pro_puuid = None
+                if pro_riot_id and "#" in pro_riot_id:
+                    try:
+                        pg, pt = pro_riot_id.split("#", 1)
+                        pro_puuid = cached_puuid(pg.strip(), pt.strip())
+                    except Exception:
+                        pro_puuid = None
+
+                if not pro_puuid:
+                    st.caption("➡️ Renseigne un Riot ID pro pour afficher la comparaison (sinon rien n’est affiché).")
+                else:
+                    pro_w0_5_list, pro_w5_10_list, pro_w10_15_list, pro_w15_30_list = [], [], [], []
+
+                    if pro_mode == "Même matchs (si présent)":
+                        for b in bundles_use:
+                            wpack = cached_wards_for_player_in_match(b["matchId"], pro_puuid)
+                            if not wpack:
+                                continue
+                            if not wpack["0_5"].empty: pro_w0_5_list.append(wpack["0_5"])
+                            if not wpack["5_10"].empty: pro_w5_10_list.append(wpack["5_10"])
+                            if not wpack["10_15"].empty: pro_w10_15_list.append(wpack["10_15"])
+                            if not wpack["15_30"].empty: pro_w15_30_list.append(wpack["15_30"])
+                    else:
+                        try:
+                            mids = client_live.get_match_ids_by_puuid(pro_puuid, count=pro_count, queue=queue_val_live)
+                        except Exception:
+                            mids = []
+                        for mid in mids:
+                            wpack = cached_wards_for_player_in_match(mid, pro_puuid)
+                            if not wpack:
+                                continue
+                            if not wpack["0_5"].empty: pro_w0_5_list.append(wpack["0_5"])
+                            if not wpack["5_10"].empty: pro_w5_10_list.append(wpack["5_10"])
+                            if not wpack["10_15"].empty: pro_w10_15_list.append(wpack["10_15"])
+                            if not wpack["15_30"].empty: pro_w15_30_list.append(wpack["15_30"])
+
+                    df_pro_w0_5 = pd.concat(pro_w0_5_list, ignore_index=True) if pro_w0_5_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+                    df_pro_w5_10 = pd.concat(pro_w5_10_list, ignore_index=True) if pro_w5_10_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+                    df_pro_w10_15 = pd.concat(pro_w10_15_list, ignore_index=True) if pro_w10_15_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+                    df_pro_w15_30 = pd.concat(pro_w15_30_list, ignore_index=True) if pro_w15_30_list else pd.DataFrame(columns=["matchId","minute","x","y","side","role","wardType","bucket"])
+
+                    df_pro_w0_5 = _filter_side(df_pro_w0_5, pro_side_filter)
+                    df_pro_w5_10 = _filter_side(df_pro_w5_10, pro_side_filter)
+                    df_pro_w10_15 = _filter_side(df_pro_w10_15, pro_side_filter)
+                    df_pro_w15_30 = _filter_side(df_pro_w15_30, pro_side_filter)
+
+                    st.markdown(f"#### Comparaison vs **{pro_riot_id}**")
+                    pg1, pg2 = st.columns(2)
+                    with pg1:
+                        fig = minimap_wards_plotly(minimap, df_pro_w0_5, f"PRO Wards 0–5 — {pro_riot_id}", ward_point_size, ward_alpha)
+                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        else: st.info("Aucune ward pro 0–5.")
+
+                        fig = minimap_wards_plotly(minimap, df_pro_w10_15, f"PRO Wards 10–15 — {pro_riot_id}", ward_point_size, ward_alpha)
+                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        else: st.info("Aucune ward pro 10–15.")
+
+                    with pg2:
+                        fig = minimap_wards_plotly(minimap, df_pro_w5_10, f"PRO Wards 5–10 — {pro_riot_id}", ward_point_size, ward_alpha)
+                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        else: st.info("Aucune ward pro 5–10.")
+
+                        fig = minimap_wards_plotly(minimap, df_pro_w15_30, f"PRO Wards 15–30 — {pro_riot_id}", ward_point_size, ward_alpha)
+                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        else: st.info("Aucune ward pro 15–30.")
+
+                    st.divider()
+                    st.markdown("#### 📌 Résumé (counts)")
+                    s1, s2 = st.columns(2)
+                    with s1:
+                        st.write("**Joueur analysé** (scope/side)")
+                        if not w_p_0_5.empty:
+                            st.dataframe(w_p_0_5["bucket"].value_counts().rename("0–5").to_frame(), use_container_width=True)
+                        if not w_p_15_30.empty:
+                            st.dataframe(w_p_15_30["bucket"].value_counts().rename("15–30").to_frame(), use_container_width=True)
+                    with s2:
+                        st.write(f"**Pro** {pro_riot_id} (mode/side)")
+                        if not df_pro_w0_5.empty:
+                            st.dataframe(df_pro_w0_5["bucket"].value_counts().rename("0–5").to_frame(), use_container_width=True)
+                        if not df_pro_w15_30.empty:
+                            st.dataframe(df_pro_w15_30["bucket"].value_counts().rename("15–30").to_frame(), use_container_width=True)
 
             with t_kills:
                 st.markdown("### Heatmap des zones où le joueur fait le plus de kills")
