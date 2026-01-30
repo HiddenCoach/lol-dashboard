@@ -1479,7 +1479,7 @@ if should_render and st.session_state.analysis_ready:
                 st.info("Aucun match ne passe les filtres / joueur absent des scrims.")
                 continue
 
-st.markdown("### 🎯 Scope d'analyse")
+            st.markdown("### 🎯 Scope d'analyse")
             match_options = ["Global (tous les matchs)"] + [b["matchId"] for b in bundles_f]
             key_scope = f"scope_{rid_full}"
 
